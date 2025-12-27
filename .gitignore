@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Local config
+buildconfig.conf
+
+# Build artifacts
+build/
+DerivedData/
+
+# Editor
+.vscode/
+.idea/
