@@ -31,6 +31,7 @@ requirements.
 git clone https://github.com/Nomis101/handbrake-builder.git
 cd handbrake-builder
 The script can be copied into /usr/local/bin
+```
 
 ## Configuration
 
