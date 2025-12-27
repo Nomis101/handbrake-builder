@@ -37,3 +37,6 @@ The script can be copied into /usr/local/bin
 The script will create a file buildconfig.conf in
 $HOME/Library/Application Support/HandBrakeBuilder
 that can be used to control the behavior of the script.
+
+Note: AI helped create this script. But I have put everything together,
+checked the quality, and tested it several times in different scenarios.
