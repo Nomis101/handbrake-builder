@@ -1,0 +1,692 @@
+#!/usr/bin/env zsh
+#
+# hb-builder — HandBrake macOS build & notarization helper
+#
+# Copyright (c) 2025 Nomis101
+# Licensed under the MIT License
+#
+# Requires:
+#   - macOS 12+
+#   - Xcode Command Line Tools
+#   - Homebrew
+#
+
+set -euo pipefail
+IFS=$'\n\t'
+setopt EXTENDED_GLOB
+
+#######################################
+# Location for buildconfig.conf file
+#######################################
+
+CONFIG_DIR="$HOME/Library/Application Support/HandBrakeBuilder"
+CONFIG_FILE="$CONFIG_DIR/buildconfig.conf"
+
+#######################################
+# Environment validation
+#######################################
+
+validate_environment() {
+    echo "▶ Validating build environment"
+
+    # --- macOS version ---
+    local macos_major
+    macos_major=$(sw_vers -productVersion | awk -F. '{print $1}')
+
+    if (( macos_major < 12 )); then
+        fail 1 $LINENO "macOS 12 or newer is required"
+    fi
+
+    # --- Xcode Command Line Tools ---
+    if ! xcode-select -p >/dev/null 2>&1; then
+        fail 1 $LINENO "Xcode Command Line Tools are not installed"
+    fi
+
+    # --- Required tools ---
+    local required_tools=(
+        git
+        clang
+        make
+        xcrun
+        codesign
+    )
+
+    for tool in "${required_tools[@]}"; do
+        has_command "$tool" || fail 1 $LINENO "Required tool not found: $tool"
+    done
+
+    # --- Notarization tools (conditional) ---
+    if [[ "$NOTARY_ENABLE" == "1" ]]; then
+        xcrun notarytool help >/dev/null 2>&1 \
+            || fail 1 $LINENO "notarytool not available (Xcode 13+ required)"
+    fi
+
+    # --- Disk space ---
+    local avail_kb required_kb
+    avail_kb=$(df -Pk "$DEV_DIR" | awk 'NR==2 {print $4}')
+    required_kb=$((30 * 1024 * 1024)) # 30 GB
+
+    if (( avail_kb < required_kb )); then
+        fail 1 $LINENO "Insufficient disk space in DEV_DIR (need ≥ 30 GB)"
+    fi
+
+    echo "✔ Environment validation passed"
+}
+
+#######################################
+# Support Functions
+#######################################
+
+fail() {
+    local exit_code="${1:-1}"
+    local line="${2:-unknown}"
+    local cmd="${3:-<no command>}"
+
+    command -v afplay >/dev/null && afplay /System/Library/Sounds/Funk.aiff || true
+    command -v terminal-notifier >/dev/null && /Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier \
+        -title "HandBrake" \
+        -message "$(date '+%d-%m-%Y %H:%M'): Build failed (Exit $exit_code, Line $line)" || true
+
+    echo "❌ Build failed"
+    echo "   Exit code : $exit_code"
+    echo "   Line      : $line"
+    echo "   Command   : $cmd"
+
+    exit "$exit_code"
+}
+
+trap 'fail $? $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
+
+has_command() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+check_command() {
+    has_command "$1" || fail 1 $LINENO "Required command not found: $1"
+}
+
+log_header() {
+    echo "========================================"
+    echo "HandBrake build started"
+    echo "Time: $(date)"
+    echo "Host: $(hostname)"
+    echo "========================================"
+}
+
+log_build_metadata() {
+    echo "----------------------------------------"
+    echo "Build metadata"
+    echo "Git commit : $(git rev-parse --short HEAD 2>/dev/null || echo n/a)"
+    echo "Git branch : $(git branch --show-current 2>/dev/null || echo n/a)"
+    echo "Compiler   : $(clang --version | head -n 1)"
+    echo "macOS      : $(sw_vers -productVersion)"
+    echo "Arch       : $(uname -m)"
+    echo "SDK        : $(xcrun --show-sdk-version)"
+    echo "Notary     : $NOTARY_ENABLE"
+    echo "Deps update: $UPDATE_DEPS"
+    echo "Auto pull  : $AUTO_GIT_PULL"
+    echo "Add config : $ADD_CONFIG_OPTS"
+    echo "Warnings   : $WARN_LOG"
+    echo "Warn level : $WARN_LEVEL"
+    echo "----------------------------------------"
+}
+
+#######################################
+# Default values (empty)
+#######################################
+
+DEV_DIR=""
+
+WARN_LOG=""
+WARN_LEVEL=""
+UPDATE_DEPS=""
+AUTO_GIT_PULL=""
+ADD_CONFIG_OPTS=""
+MAKE_PKG=""
+
+NOTARY_ENABLE=""
+NOTARY_USERNAME=""
+NOTARY_TEAMID=""
+
+CFLAGS=""
+CXXFLAGS=""
+OBJCFLAGS=""
+OBJCXXFLAGS=""
+
+#######################################
+# Load configuration file
+#######################################
+
+load_config() {
+    # Does file exist
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo "✔ Configuration file found – loading"
+        source "$CONFIG_FILE"
+    else
+        echo "ℹ️ No configuration file found:"
+        echo "   $CONFIG_FILE"
+        read "answer?Create a configuration file from template? [Yes/No]: "
+
+        case "$answer" in
+            Yes|yes|Y|y)
+                mkdir -p "$CONFIG_DIR"
+                
+                # Check DEV_DIR
+                if [[ -z "$DEV_DIR" ]]; then
+                    DEV_DIR="$HOME//Documents"
+                    echo "⚠️ DEV_DIR was empty – setting to $DEV_DIR"
+                fi
+
+                # Write template to DEV_DIR
+                cat <<'EOF' > "$CONFIG_FILE"
+# ============================================================
+# HandBrake Builder – buildconfig.conf
+#
+# This file controls how the HandBrake build script behaves.
+# All values are optional. If a value is empty, a sensible
+# default will be used by the build script.
+#
+# The file is sourced by zsh – keep valid shell syntax!
+# ============================================================
+
+
+# Absolute path to your development directory.
+# Examples:
+#   DEV_DIR="$HOME/Developer"
+#   DEV_DIR="/Volumes/Developer"
+DEV_DIR="$HOME/Documents"
+
+# Log generation
+# Enable (1) or disable (0) collection of compiler log
+# into a lof file
+ENABLE_LOG=1
+# Warning log generation
+# Enable (1) or disable (0) collection of compiler warnings
+# into a separate warnings log file.
+WARN_LOG=
+
+# Compiler warning verbosity (set from 0 to 2)
+# Higher levels can generate *many* warnings.
+WARN_LEVEL=
+
+# Dependency handling (Homebrew)
+# Automatically update and upgrade Homebrew dependencies
+# before starting the build if set to 1 (disable set to 0)
+UPDATE_DEPS=
+
+# Git repository auto-update
+# If set to 1, automatically pull new commits from the HandBrake Git
+# repository if the local branch is behind the upstream.
+AUTO_GIT_PULL=
+
+# Additional configure options
+# Extra options appended to ./configure.
+# Example:
+#   ADD_CONFIG_OPTS="--df-jobs=3 --lto=thin"
+ADD_CONFIG_OPTS=""
+
+# macOS notarization
+# Enable (1) or disable (0) notarization of the built application.
+NOTARY_ENABLE=
+
+# Apple ID used for notarization
+NOTARY_USERNAME=""
+
+# Apple Developer Team ID used for notarization
+NOTARY_TEAMID=""
+
+# IMPORTANT:
+# The notarization password is NOT stored here.
+# It must be stored in the macOS Keychain:
+#
+#   security add-generic-password \
+#       -a "<apple-id>" \
+#       -s "HandBrakeNotary" \
+#       -w "<app-specific-password>"
+#
+# The build script will retrieve it automatically.
+# ------------------------------------------------------------
+
+# Create a pkg installer file at the end of the build
+MAKE_PKG=
+
+# Custom compiler flags
+# Additional compiler flags to append to the build.
+# These are optional and advanced usage.
+CFLAGS=""
+CXXFLAGS=""
+OBJCFLAGS=""
+OBJCXXFLAGS=""
+EOF
+
+                echo "✔ Configuration file created from template:"
+                echo "   $CONFIG_FILE"
+                ;;
+            *)
+                echo "ℹ️ Running script with default values"
+                # Check DEV_DIR pand set to default if needed
+                if [[ -z "$DEV_DIR" ]]; then
+                    DEV_DIR="$HOME/Developer"
+                    echo "⚠️ DEV_DIR was empty – automatically set to $DEV_DIR"
+                fi
+                ;;
+        esac
+    fi
+
+    # After loading check if DEV_DIR is still empty
+    if [[ -z "$DEV_DIR" ]]; then
+        DEV_DIR="$HOME/Developer"
+        echo "⚠️ DEV_DIR still empty after loading – automatically set to $DEV_DIR"
+    fi
+}
+
+load_config
+validate_environment
+
+#######################################
+# Derived configuration
+#######################################
+
+ROOT="$DEV_DIR/HandBrake"
+BUILD_DIR="$ROOT/build"
+INSTALL_APP="/Applications/HandBrake.app"
+APP_BIN="$BUILD_DIR/xroot/HandBrake.app/Contents/MacOS/HandBrake"
+LOGDIR="$CONFIG_DIR/logs"
+LOGFILE="$LOGDIR/build-$(date '+%Y%m%d-%H%M').log"
+WARNLOG="$LOGDIR/warnings-$(date '+%Y%m%d-%H%M').log"
+
+#######################################
+# Homebrew check / install
+#######################################
+
+if ! has_command brew; then
+    echo "🍺 Homebrew not found – starting installation"
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+else
+    echo "✔ Homebrew is installed"
+fi
+
+#######################################
+# Homebrew dependencies
+#######################################
+
+BREW_DEPS=(
+    autoconf
+    automake
+    cmake
+    libtool
+    meson
+    ninja
+    pkg-config
+    unix2dos
+)
+
+MISSING_DEPS=()
+
+for dep in "${BREW_DEPS[@]}"; do
+    brew list --formula "$dep" >/dev/null 2>&1 || MISSING_DEPS+=("$dep")
+done
+
+if (( ${#MISSING_DEPS[@]} > 0 )); then
+    echo "⬇️ Installing missing dependencies:"
+    printf '  - %s\n' "${MISSING_DEPS[@]}"
+    brew install "${MISSING_DEPS[@]}"
+else
+    echo "✔ All Homebrew dependencies are installed"
+fi
+
+#######################################
+# HandBrake repository
+#######################################
+
+if [[ ! -d "$ROOT/.git" ]]; then
+    echo "📦 HandBrake repository not found – cloning into $DEV_DIR"
+    cd "$DEV_DIR"
+    git clone https://github.com/HandBrake/HandBrake.git
+else
+    echo "✔ HandBrake repository present"
+fi
+
+#######################################
+# Logging
+#######################################
+
+log_header() {
+    if [[ "$ENABLE_LOG" == "1" ]]; then
+        mkdir -p "$LOGDIR"
+        find "$LOGDIR" -type f -name 'build-*.log' -mtime +14 -delete || true
+        find "$LOGDIR" -type f \( -name 'build-*.log' -o -name 'warnings-*.log' \) -mtime +14 -delete || true
+        ls -1t "$LOGDIR"/build-*.log(N) | tail -n +50 | xargs -r rm --
+        ls -1t "$LOGDIR"/warnings-*.log(N) | tail -n +50 | xargs -r rm --
+         exec > >(tee -a "$LOGFILE") 2>&1
+    fi
+}
+
+log_header
+
+#######################################
+# Git-Update
+#######################################
+
+check_git_updates() {
+    [[ "$AUTO_GIT_PULL" == "1" ]] || {
+        echo "ℹ️ AUTO_GIT_PULL disabled"
+        return
+    }
+
+    cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
+
+    [[ -d .git ]] || {
+        echo "ℹ️ Not a Git repository"
+        return
+    }
+
+    echo "🔍 Checking Git status …"
+    git fetch --quiet origin
+
+    if [[ "$(git rev-parse HEAD)" != "$(git rev-parse @{u})" ]]; then
+        echo "⬇️ New commits detected – running git pull"
+        git pull --ff-only --quiet
+    else
+        echo "✔ Repository is up to date"
+    fi
+}
+
+check_git_updates
+log_build_metadata
+
+#######################################
+# Determine Developer-ID
+#######################################
+
+SIGNINGHASH=$(
+    security find-identity -p codesigning -v |
+    awk '/Developer ID Application:/ { print $2; exit }'
+)
+
+[[ -n "$SIGNINGHASH" ]] || fail 1 $LINENO "No Developer ID found"
+
+#######################################
+# Set warning levels
+#######################################
+
+WARNING_FLAGS=""
+
+case "$WARN_LEVEL" in
+    0|"")
+        ;;
+    1)
+        WARNING_FLAGS="-Wall -Wextra"
+        ;;
+    2)
+        WARNING_FLAGS="-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion"
+        ;;
+    *)
+        fail 1 $LINENO "Invalid WARNING_LEVEL=$WARNING_LEVEL"
+        ;;
+esac
+
+#######################################
+# Append warning flags
+#######################################
+
+if [[ -n "$WARNING_FLAGS" ]]; then
+    CFLAGS="$CFLAGS $WARNING_FLAGS"
+    CXXFLAGS="$CXXFLAGS $WARNING_FLAGS"
+    OBJCFLAGS="$OBJCFLAGS $WARNING_FLAGS"
+    OBJCXXFLAGS="$OBJCXXFLAGS $WARNING_FLAGS"
+fi
+
+#######################################
+# Export compiler flags
+#######################################
+
+[[ -n "$CFLAGS" ]] && export CFLAGS
+[[ -n "$CXXFLAGS" ]] && export CXXFLAGS
+[[ -n "$OBJCFLAGS" ]] && export OBJCFLAGS
+[[ -n "$OBJCXXFLAGS" ]] && export OBJCXXFLAGS
+
+#######################################
+# Dependencies
+#######################################
+
+install_deps() {
+    if [[ "$UPDATE_DEPS" == "1" ]]; then
+        check_command brew
+        brew update
+        brew upgrade
+        brew cleanup
+        command -v rustup >/dev/null && rustup update || true
+    fi
+}
+
+install_deps
+
+#######################################
+# Clean
+#######################################
+
+clean_build() {
+    [[ "$BUILD_DIR" == "$ROOT"/build ]] || fail 1 $LINENO "Invalid build directory"
+    rm -rf "$BUILD_DIR"
+    rm -f "$ROOT/hbsign.log"
+    rm -rf "$ROOT/macosx/DerivedData"
+}
+
+clean_build
+
+#######################################
+# Configure and build
+#######################################
+
+build_handbrake() {
+    cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
+
+    JOBS=$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || sysctl -n hw.ncpu)
+    JOBS=${JOBS:-4}
+
+echo "▶ ./configure options:"
+echo "   --launch-jobs=$JOBS --launch $ADD_CONFIG_OPTS"
+
+typeset -a CONFIG_OPTS
+CONFIG_OPTS=(${(z)ADD_CONFIG_OPTS})
+
+./configure \
+    --launch-jobs="$JOBS" \
+    --launch \
+    "${CONFIG_OPTS[@]}"
+
+    cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
+    make build
+
+}
+
+build_handbrake
+
+#######################################
+# Sign
+#######################################
+
+sign_handbrake() {
+    make sign ID="$SIGNINGHASH"
+}
+
+sign_handbrake
+
+#######################################
+# Notarization
+#######################################
+
+get_notary_password() {
+    [[ "$NOTARY_ENABLE" == "1" ]] || return 0
+
+    security find-generic-password \
+        -a "$NOTARY_USERNAME" \
+        -s "HandBrakeNotary" \
+        -w 2>/dev/null
+}
+
+run_notarization() {
+    [[ "$NOTARY_ENABLE" == "1" ]] || {
+        echo "ℹ️ Notarization disabled"
+        return 0
+    }
+
+    NOTARY_PASSWORD="$(get_notary_password)"
+    [[ -n "$NOTARY_PASSWORD" ]] || fail 1 $LINENO "Notary password not found in keychain"
+
+    echo "🔐 Starting notarization"
+    cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
+
+    set +e
+       make notarize \
+       USERNAME="$NOTARY_USERNAME" \
+       TEAMID="$NOTARY_TEAMID" \
+       PASSWORD="$NOTARY_PASSWORD"
+    NOTARY_RC=$?
+    set -e
+
+    if (( NOTARY_RC != 0 )); then
+        echo "❌ Notarization failed (exit code $NOTARY_RC)"
+        echo
+        echo "ℹ️ Last notarytool history (if available):"
+        xcrun notarytool history \
+            --apple-id "$NOTARY_USERNAME" \
+            --team-id "$NOTARY_TEAMID" 2>/dev/null || true
+
+        return "$NOTARY_RC"
+    fi
+
+    echo "✔ Notarization successful"
+    return 0
+}
+
+run_notarization
+
+#######################################
+# Install
+#######################################
+
+install_app() {
+    [[ -x "$APP_BIN" ]] || fail 1 $LINENO "Application binary does not exist"
+    [[ -d "$INSTALL_APP" ]] || echo "ℹ️ Target application does not yet exist"
+    cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
+    make install
+}
+
+install_app
+
+#######################################
+# Security checks
+#######################################
+
+verify_app() {
+    codesign --verify --deep --strict --verbose=4 "$INSTALL_APP" || fail $? $LINENO "Code signing verification failed"
+    codesign -dvv "$INSTALL_APP"
+    spctl --assess --type exec --verbose "$INSTALL_APP"
+}
+
+verify_app
+
+optional_checks() {
+    command -v check-signature >/dev/null 2>&1 && check-signature "$INSTALL_APP" || true
+    otool -hv "$INSTALL_APP/Contents/MacOS/HandBrake"
+    otool -Iv "$INSTALL_APP/Contents/MacOS/HandBrake" | grep -i stack || true
+}
+
+optional_checks
+
+#######################################
+# Success
+#######################################
+
+command -v afplay >/dev/null && afplay /System/Applications/Music.app/Contents/Resources/complete.aif || true
+command -v terminal-notifier >/dev/null && /Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier \
+    -title "HandBrake" \
+    -message "$(date '+%d-%m-%Y %H:%M'): Build successful"
+    
+#######################################
+# Package creation (optional)
+#######################################
+
+create_pkg() {
+    [[ "$MAKE_PKG" == "1" ]] || {
+        echo "ℹ️ - Package creation disabled"
+        return 0
+    }
+
+    echo "📦 Creating installer package"
+
+    cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
+
+    set +e
+    make pkg.create
+    PKG_RC=$?
+    set -e
+
+    if (( PKG_RC != 0 )); then
+        fail "$PKG_RC" $LINENO "make pkg.create failed"
+    fi
+
+    # Locate generated pkg
+    PKG_FILE=$(ls -t *.pkg 2>/dev/null | head -n 1 || true)
+
+    if [[ -z "$PKG_FILE" ]]; then
+        fail 1 $LINENO "Package was created but no .pkg file was found"
+    fi
+
+    echo "✔ Package created: $PKG_FILE"
+    echo
+    echo "🔑 SHA-256 checksum:"
+    shasum -a 256 "$PKG_FILE"
+}
+
+#######################################
+# Collect compiler warnings
+#######################################
+
+collect_warnings() {
+    [[ "$WARN_LOG" == "1" ]] || return 0
+
+    echo "▶ Collecting compiler warnings"
+
+    : > "$WARNLOG"
+
+    sed -E 's/\x1B\[[0-9;]*[mK]//g' "$LOGFILE" \
+    | awk '
+    BEGIN {
+    IGNORECASE = 1
+    warn = 0
+}
+
+/(^|[[:space:]])warning:/ {
+    warn = 1
+    sub(/^[[:space:]]*/, "  : ")
+    print
+    next
+}
+
+warn && /(^|[[:space:]])note:/ {
+    sub(/^[[:space:]]*/, "  : ")
+    print
+    next
+}
+
+/^[^[:space:]]/ {
+    warn = 0
+}
+' >> "$WARNLOG"
+
+    if [[ -s "$WARNLOG" ]]; then
+        echo "⚠️  Compiler warnings found: $(wc -l < "$WARNLOG")"
+        echo "   → $WARNLOG"
+    else
+        rm -f "$WARNLOG"
+        echo "✔ No compiler warnings found"
+    fi
+}
+
+collect_warnings
+create_pkg
+exit 0
