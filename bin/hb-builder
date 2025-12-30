@@ -87,7 +87,7 @@ fail() {
         -title "HandBrake" \
         -message "$(date '+%d-%m-%Y %H:%M'): Build failed (Exit $exit_code, Line $line)" || true
 
-    echo "❌ Build failed"
+    echo "❌  Build failed"
     echo "   Exit code : $exit_code"
     echo "   Line      : $line"
     echo "   Command   : $cmd"
@@ -174,7 +174,7 @@ load_config() {
                 # Check DEV_DIR
                 if [[ -z "$DEV_DIR" ]]; then
                     DEV_DIR="$HOME//Documents"
-                    echo "⚠️ DEV_DIR was empty – setting to $DEV_DIR"
+                    echo "⚠️  DEV_DIR was empty – setting to $DEV_DIR"
                 fi
 
                 # Write template to DEV_DIR
@@ -263,11 +263,11 @@ EOF
                 echo "   $CONFIG_FILE"
                 ;;
             *)
-                echo "ℹ️ Running script with default values"
+                echo "ℹ️  Running script with default values"
                 # Check DEV_DIR pand set to default if needed
                 if [[ -z "$DEV_DIR" ]]; then
                     DEV_DIR="$HOME/Developer"
-                    echo "⚠️ DEV_DIR was empty – automatically set to $DEV_DIR"
+                    echo "⚠️  DEV_DIR was empty – automatically set to $DEV_DIR"
                 fi
                 ;;
         esac
@@ -276,7 +276,7 @@ EOF
     # After loading check if DEV_DIR is still empty
     if [[ -z "$DEV_DIR" ]]; then
         DEV_DIR="$HOME/Developer"
-        echo "⚠️ DEV_DIR still empty after loading – automatically set to $DEV_DIR"
+        echo "⚠️  DEV_DIR still empty after loading – automatically set to $DEV_DIR"
     fi
 }
 
@@ -300,7 +300,7 @@ WARNLOG="$LOGDIR/warnings-$(date '+%Y%m%d-%H%M').log"
 #######################################
 
 if ! has_command brew; then
-    echo "🍺 Homebrew not found – starting installation"
+    echo "🍺  Homebrew not found – starting installation"
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     eval "$(/opt/homebrew/bin/brew shellenv)"
 else
@@ -314,9 +314,11 @@ fi
 BREW_DEPS=(
     autoconf
     automake
+    cargo-c
     cmake
     libtool
     meson
+    nasm
     ninja
     pkg-config
     unix2dos
@@ -341,7 +343,7 @@ fi
 #######################################
 
 if [[ ! -d "$ROOT/.git" ]]; then
-    echo "📦 HandBrake repository not found – cloning into $DEV_DIR"
+    echo "📦  HandBrake repository not found – cloning into $DEV_DIR"
     cd "$DEV_DIR"
     git clone https://github.com/HandBrake/HandBrake.git
 else
@@ -371,22 +373,22 @@ log_header
 
 check_git_updates() {
     [[ "$AUTO_GIT_PULL" == "1" ]] || {
-        echo "ℹ️ AUTO_GIT_PULL disabled"
+        echo "ℹ️  AUTO_GIT_PULL disabled"
         return
     }
 
     cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
 
     [[ -d .git ]] || {
-        echo "ℹ️ Not a Git repository"
+        echo "ℹ️  Not a Git repository"
         return
     }
 
-    echo "🔍 Checking Git status …"
+    echo "🔍  Checking Git status …"
     git fetch --quiet origin
 
     if [[ "$(git rev-parse HEAD)" != "$(git rev-parse @{u})" ]]; then
-        echo "⬇️ New commits detected – running git pull"
+        echo "⬇️  New commits detected – running git pull"
         git pull --ff-only --quiet
     else
         echo "✔ Repository is up to date"
@@ -536,7 +538,7 @@ run_notarization() {
     NOTARY_PASSWORD="$(get_notary_password)"
     [[ -n "$NOTARY_PASSWORD" ]] || fail 1 $LINENO "Notary password not found in keychain"
 
-    echo "🔐 Starting notarization"
+    echo "🔐  Starting notarization"
     cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
 
     set +e
@@ -548,9 +550,9 @@ run_notarization() {
     set -e
 
     if (( NOTARY_RC != 0 )); then
-        echo "❌ Notarization failed (exit code $NOTARY_RC)"
+        echo "❌  Notarization failed (exit code $NOTARY_RC)"
         echo
-        echo "ℹ️ Last notarytool history (if available):"
+        echo "ℹ️  Last notarytool history (if available):"
         xcrun notarytool history \
             --apple-id "$NOTARY_USERNAME" \
             --team-id "$NOTARY_TEAMID" 2>/dev/null || true
@@ -584,7 +586,8 @@ install_app
 verify_app() {
     codesign --verify --deep --strict --verbose=4 "$INSTALL_APP" || fail $? $LINENO "Code signing verification failed"
     codesign -dvv "$INSTALL_APP"
-    spctl --assess --type exec --verbose "$INSTALL_APP"
+    spctl -a -vvv -t install "$INSTALL_APP"
+    stapler validate "$INSTALL_APP"
 }
 
 verify_app
@@ -612,11 +615,11 @@ command -v terminal-notifier >/dev/null && /Applications/terminal-notifier.app/C
 
 create_pkg() {
     [[ "$MAKE_PKG" == "1" ]] || {
-        echo "ℹ️ - Package creation disabled"
+        echo "ℹ️  Package creation disabled"
         return 0
     }
 
-    echo "📦 Creating installer package"
+    echo "📦  Creating installer package"
 
     cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
 
@@ -638,7 +641,7 @@ create_pkg() {
 
     echo "✔ Package created: $PKG_FILE"
     echo
-    echo "🔑 SHA-256 checksum:"
+    echo "🔑  SHA-256 checksum:"
     shasum -a 256 "$PKG_FILE"
 }
 
