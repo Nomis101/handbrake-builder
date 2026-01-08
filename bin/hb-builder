@@ -302,13 +302,16 @@ WARNLOG="$LOGDIR/warnings-$(date '+%Y%m%d-%H%M').log"
 #######################################
 
 install_cargo_c() {
+    # Check if Cargo is available
     if ! command -v cargo >/dev/null 2>&1; then
-        fail 1 $LINENO "Rust / cargo not found – required for cargo-c"
+        echo "ℹ️ Rust / Cargo not found – installing via rustup"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        export PATH="$HOME/.cargo/bin:$PATH"
     fi
 
     # Check if cargo-c is installed
     if command -v cargo-c >/dev/null 2>&1; then
-        echo "✔ cargo-c already installed, updating..."
+        echo "✔ cargo-c already installed – updating..."
         cargo install cargo-c --force
     else
         echo "⬇️ Installing cargo-c via cargo"
