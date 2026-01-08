@@ -95,7 +95,7 @@ fail() {
     exit "$exit_code"
 }
 
-trap 'fail $? $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
+trap '[[ $? -ne 0 ]] && fail $? $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
 
 has_command() {
     command -v "$1" >/dev/null 2>&1
@@ -105,7 +105,7 @@ check_command() {
     has_command "$1" || fail 1 $LINENO "Required command not found: $1"
 }
 
-log_header() {
+log_intro() {
     echo "========================================"
     echo "HandBrake build started"
     echo "Time: $(date)"
@@ -116,42 +116,20 @@ log_header() {
 log_build_metadata() {
     echo "----------------------------------------"
     echo "Build metadata"
-    echo "Git commit : $(git rev-parse --short HEAD 2>/dev/null || echo n/a)"
-    echo "Git branch : $(git branch --show-current 2>/dev/null || echo n/a)"
-    echo "Compiler   : $(clang --version | head -n 1)"
-    echo "macOS      : $(sw_vers -productVersion)"
-    echo "Arch       : $(uname -m)"
-    echo "SDK        : $(xcrun --show-sdk-version)"
-    echo "Notary     : $NOTARY_ENABLE"
-    echo "Deps update: $UPDATE_DEPS"
-    echo "Auto pull  : $AUTO_GIT_PULL"
-    echo "Add config : $ADD_CONFIG_OPTS"
-    echo "Warnings   : $WARN_LOG"
-    echo "Warn level : $WARN_LEVEL"
+    echo "Git commit  : $(git rev-parse --short HEAD 2>/dev/null || echo n/a)"
+    echo "Git branch  : $(git branch --show-current 2>/dev/null || echo n/a)"
+    echo "Compiler    : $(clang --version | head -n 1)"
+    echo "macOS       : $(sw_vers -productVersion)"
+    echo "Arch        : $(uname -m)"
+    echo "SDK         : $(xcrun --show-sdk-version)"
+    echo "Notary      : ${NOTARY_ENABLE:-0}"
+    echo "Deps update : ${UPDATE_DEPS:-}"
+    echo "Auto pull   : ${AUTO_GIT_PULL:-}"
+    echo "Add config  : ${ADD_CONFIG_OPTS:-}"
+    echo "Log warnings: ${WARN_LOG:-}"
+    echo "Warn level  : ${WARN_LEVEL:-}"
     echo "----------------------------------------"
 }
-
-#######################################
-# Default values (empty)
-#######################################
-
-DEV_DIR=""
-
-WARN_LOG=""
-WARN_LEVEL=""
-UPDATE_DEPS=""
-AUTO_GIT_PULL=""
-ADD_CONFIG_OPTS=""
-MAKE_PKG=""
-
-NOTARY_ENABLE=""
-NOTARY_USERNAME=""
-NOTARY_TEAMID=""
-
-CFLAGS=""
-CXXFLAGS=""
-OBJCFLAGS=""
-OBJCXXFLAGS=""
 
 #######################################
 # Load configuration file
@@ -163,12 +141,13 @@ load_config() {
         echo "✔ Configuration file found – loading"
         source "$CONFIG_FILE"
     else
-        echo "ℹ️ No configuration file found:"
+        echo "ℹ️  No configuration file found:"
         echo "   $CONFIG_FILE"
         read "answer?Create a configuration file from template? [Yes/No]: "
 
         case "$answer" in
             Yes|yes|Y|y)
+                echo "Creating configuration file"
                 mkdir -p "$CONFIG_DIR"
                 
                 # Check DEV_DIR
@@ -247,8 +226,8 @@ NOTARY_TEAMID=""
 # The build script will retrieve it automatically.
 # ------------------------------------------------------------
 
-# Create a pkg installer file at the end of the build
-MAKE_PKG=
+# Create a installer file at the end of the build
+MAKE_INSTALLER=
 
 # Custom compiler flags
 # Additional compiler flags to append to the build.
@@ -281,8 +260,31 @@ EOF
 }
 
 load_config
-validate_environment
 
+#######################################
+# Enforce defaults (nounset safety)
+#######################################
+
+: "${DEV_DIR:=$HOME/Developer}"
+
+: "${ENABLE_LOG:=}"
+: "${WARN_LOG:=}"
+: "${WARN_LEVEL:=}"
+: "${UPDATE_DEPS:=}"
+: "${AUTO_GIT_PULL:=}"
+: "${ADD_CONFIG_OPTS:=}"
+: "${MAKE_INSTALLER:=}"
+
+: "${NOTARY_ENABLE:=0}"
+: "${NOTARY_USERNAME:=}"
+: "${NOTARY_TEAMID:=}"
+
+: "${CFLAGS:=}"
+: "${CXXFLAGS:=}"
+: "${OBJCFLAGS:=}"
+: "${OBJCXXFLAGS:=}"
+
+validate_environment
 #######################################
 # Derived configuration
 #######################################
@@ -294,6 +296,25 @@ APP_BIN="$BUILD_DIR/xroot/HandBrake.app/Contents/MacOS/HandBrake"
 LOGDIR="$CONFIG_DIR/logs"
 LOGFILE="$LOGDIR/build-$(date '+%Y%m%d-%H%M').log"
 WARNLOG="$LOGDIR/warnings-$(date '+%Y%m%d-%H%M').log"
+
+#######################################
+# Check for cargo-c
+#######################################
+
+install_cargo_c() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        fail 1 $LINENO "Rust / cargo not found – required for cargo-c"
+    fi
+
+    # Check if cargo-c is installed
+    if command -v cargo-c >/dev/null 2>&1; then
+        echo "✔ cargo-c already installed, updating..."
+        cargo install cargo-c --force
+    else
+        echo "⬇️ Installing cargo-c via cargo"
+        cargo install cargo-c
+    fi
+}
 
 #######################################
 # Homebrew check / install
@@ -311,10 +332,11 @@ fi
 # Homebrew dependencies
 #######################################
 
+install_homebrew_deps() {
+
 BREW_DEPS=(
     autoconf
     automake
-    cargo-c
     cmake
     libtool
     meson
@@ -331,12 +353,19 @@ for dep in "${BREW_DEPS[@]}"; do
 done
 
 if (( ${#MISSING_DEPS[@]} > 0 )); then
-    echo "⬇️ Installing missing dependencies:"
+    echo "⬇️  Installing missing Homebrew dependencies:"
     printf '  - %s\n' "${MISSING_DEPS[@]}"
     brew install "${MISSING_DEPS[@]}"
 else
     echo "✔ All Homebrew dependencies are installed"
 fi
+}
+
+# Homebrew-Tools
+install_homebrew_deps
+
+# Rust/Cargo Tools
+install_cargo_c
 
 #######################################
 # HandBrake repository
@@ -361,7 +390,7 @@ log_header() {
         find "$LOGDIR" -type f \( -name 'build-*.log' -o -name 'warnings-*.log' \) -mtime +14 -delete || true
         ls -1t "$LOGDIR"/build-*.log(N) | tail -n +50 | xargs -r rm --
         ls -1t "$LOGDIR"/warnings-*.log(N) | tail -n +50 | xargs -r rm --
-         exec > >(tee -a "$LOGFILE") 2>&1
+        exec > >(tee -a "$LOGFILE") 2>&1
     fi
 }
 
@@ -372,10 +401,10 @@ log_header
 #######################################
 
 check_git_updates() {
-    [[ "$AUTO_GIT_PULL" == "1" ]] || {
+    if [[ "$AUTO_GIT_PULL" != "1" ]]; then
         echo "ℹ️  AUTO_GIT_PULL disabled"
         return
-    }
+    fi
 
     cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
 
@@ -384,18 +413,26 @@ check_git_updates() {
         return
     }
 
-    echo "🔍  Checking Git status …"
+    echo "🔍 Checking Git repository state"
     git fetch --quiet origin
 
-    if [[ "$(git rev-parse HEAD)" != "$(git rev-parse @{u})" ]]; then
-        echo "⬇️  New commits detected – running git pull"
-        git pull --ff-only --quiet
-    else
-        echo "✔ Repository is up to date"
+    if ! git pull --ff-only; then
+        echo "❌ git pull failed"
+
+        if git status --porcelain | grep -E '^(UU|AA|DD)' >/dev/null; then
+            echo "🔀 Merge conflicts detected:"
+            git status --porcelain | awk '/^(UU|AA|DD)/ { print "   - " $2 }'
+        else
+            echo "ℹ️ Git status:"
+            git status --short
+        fi
+
+        fail 1 $LINENO "git pull failed"
     fi
 }
 
 check_git_updates
+log_intro
 log_build_metadata
 
 #######################################
@@ -415,8 +452,8 @@ SIGNINGHASH=$(
 
 WARNING_FLAGS=""
 
-case "$WARN_LEVEL" in
-    0|"")
+case "${WARN_LEVEL:-}" in
+    ""|0)
         ;;
     1)
         WARNING_FLAGS="-Wall -Wextra"
@@ -425,7 +462,7 @@ case "$WARN_LEVEL" in
         WARNING_FLAGS="-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion"
         ;;
     *)
-        fail 1 $LINENO "Invalid WARNING_LEVEL=$WARNING_LEVEL"
+        fail 1 $LINENO "Invalid WARNING_LEVEL=${WARN_LEVEL}"
         ;;
 esac
 
@@ -454,13 +491,15 @@ fi
 #######################################
 
 install_deps() {
-    if [[ "$UPDATE_DEPS" == "1" ]]; then
-        check_command brew
-        brew update
-        brew upgrade
-        brew cleanup
-        command -v rustup >/dev/null && rustup update || true
+    if [[ "$UPDATE_DEPS" != "1" ]]; then
+        return
     fi
+
+    check_command brew
+    brew update
+    brew upgrade
+    brew cleanup
+    command -v rustup >/dev/null && rustup update || true
 }
 
 install_deps
@@ -482,7 +521,7 @@ clean_build
 # Configure and build
 #######################################
 
-build_handbrake() {
+configure_handbrake() {
     cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
 
     JOBS=$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || sysctl -n hw.ncpu)
@@ -492,18 +531,36 @@ echo "▶ ./configure options:"
 echo "   --launch-jobs=$JOBS --launch $ADD_CONFIG_OPTS"
 
 typeset -a CONFIG_OPTS
-CONFIG_OPTS=(${(z)ADD_CONFIG_OPTS})
+CONFIG_OPTS=(${(z)${ADD_CONFIG_OPTS:-}})
 
 ./configure \
     --launch-jobs="$JOBS" \
     --launch \
     "${CONFIG_OPTS[@]}"
+}
 
+build_handbrake() {
     cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
-    make build
+    echo "▶ Running make build"
+
+    set +e
+    make build 2>&1 | tee -a "$LOGFILE"
+    local rc=${pipestatus[1]}
+    set -e
+
+    if (( rc != 0 )); then
+        echo
+        echo "❌ Build failed during compilation"
+        echo "🔍 Last compiler errors:"
+
+        grep -E "error:|fatal error:" "$LOGFILE" | tail -n 20 | sed 's/^/   /'
+
+        fail "$rc" $LINENO "make build failed"
+    fi
 
 }
 
+configure_handbrake
 build_handbrake
 
 #######################################
@@ -511,6 +568,7 @@ build_handbrake
 #######################################
 
 sign_handbrake() {
+    echo "Signing the build"
     make sign ID="$SIGNINGHASH"
 }
 
@@ -519,9 +577,19 @@ sign_handbrake
 #######################################
 # Notarization
 #######################################
+validate_notary_config() {
+    if [[ "$NOTARY_ENABLE" != "1" ]]; then
+    return
+fi
+
+    [[ -n "$NOTARY_USERNAME" ]] || fail 1 $LINENO "NOTARY_USERNAME required when NOTARY_ENABLE=1"
+    [[ -n "$NOTARY_TEAMID"  ]] || fail 1 $LINENO "NOTARY_TEAMID required when NOTARY_ENABLE=1"
+}
 
 get_notary_password() {
-    [[ "$NOTARY_ENABLE" == "1" ]] || return 0
+    if [[ "$NOTARY_ENABLE" != "1" ]]; then
+        return
+    fi
 
     security find-generic-password \
         -a "$NOTARY_USERNAME" \
@@ -530,29 +598,31 @@ get_notary_password() {
 }
 
 run_notarization() {
-    [[ "$NOTARY_ENABLE" == "1" ]] || {
+    if [[ "$NOTARY_ENABLE" != "1" ]]; then
         echo "ℹ️ Notarization disabled"
-        return 0
-    }
+        return
+    fi
 
     NOTARY_PASSWORD="$(get_notary_password)"
+
     [[ -n "$NOTARY_PASSWORD" ]] || fail 1 $LINENO "Notary password not found in keychain"
 
     echo "🔐  Starting notarization"
     cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
 
     set +e
-       make notarize \
-       USERNAME="$NOTARY_USERNAME" \
-       TEAMID="$NOTARY_TEAMID" \
-       PASSWORD="$NOTARY_PASSWORD"
-    NOTARY_RC=$?
+    make notarize \
+        USERNAME="$NOTARY_USERNAME" \
+        TEAMID="$NOTARY_TEAMID" \
+        PASSWORD="$NOTARY_PASSWORD"
+    local NOTARY_RC=$?
     set -e
 
     if (( NOTARY_RC != 0 )); then
         echo "❌  Notarization failed (exit code $NOTARY_RC)"
         echo
         echo "ℹ️  Last notarytool history (if available):"
+
         xcrun notarytool history \
             --apple-id "$NOTARY_USERNAME" \
             --team-id "$NOTARY_TEAMID" 2>/dev/null || true
@@ -561,9 +631,8 @@ run_notarization() {
     fi
 
     echo "✔ Notarization successful"
-    return 0
 }
-
+validate_notary_config
 run_notarization
 
 #######################################
@@ -574,6 +643,7 @@ install_app() {
     [[ -x "$APP_BIN" ]] || fail 1 $LINENO "Application binary does not exist"
     [[ -d "$INSTALL_APP" ]] || echo "ℹ️ Target application does not yet exist"
     cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
+    echo "The finished HandBrake build will now be installed in the Application folder"
     make install
 }
 
@@ -584,10 +654,18 @@ install_app
 #######################################
 
 verify_app() {
-    codesign --verify --deep --strict --verbose=4 "$INSTALL_APP" || fail $? $LINENO "Code signing verification failed"
-    codesign -dvv "$INSTALL_APP"
-    spctl -a -vvv -t install "$INSTALL_APP"
-    stapler validate "$INSTALL_APP"
+    codesign --verify --deep --strict --verbose=4 "$INSTALL_APP" \
+        || fail $? $LINENO "Code signing verification failed"
+
+    if [[ "$NOTARY_ENABLE" == "1" ]]; then
+        spctl -a -vvv -t install "$INSTALL_APP" \
+            || fail $? $LINENO "spctl assessment failed"
+
+        stapler validate "$INSTALL_APP" \
+            || fail $? $LINENO "stapler validation failed"
+    else
+        echo "ℹ️  Skipping Gatekeeper & stapler checks (NOTARY_ENABLE=0)"
+    fi
 }
 
 verify_app
@@ -614,35 +692,31 @@ command -v terminal-notifier >/dev/null && /Applications/terminal-notifier.app/C
 #######################################
 
 create_pkg() {
-    [[ "$MAKE_PKG" == "1" ]] || {
+    if [[ "$MAKE_INSTALLER" != "1" ]]; then
         echo "ℹ️  Package creation disabled"
-        return 0
-    }
+        return
+    fi
 
-    echo "📦  Creating installer package"
+    echo "📦  Creating release artifacts"
 
     cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
 
     set +e
     make pkg.create
-    PKG_RC=$?
+    local PKG_RC=$?
     set -e
 
-    if (( PKG_RC != 0 )); then
-        fail "$PKG_RC" $LINENO "make pkg.create failed"
-    fi
+    (( PKG_RC == 0 )) || fail "$PKG_RC" $LINENO "Package creation failed"
 
-    # Locate generated pkg
-    PKG_FILE=$(ls -t *.pkg 2>/dev/null | head -n 1 || true)
+    echo "✔ Release artifacts created:"
+    ls -lh pkg/*.dmg pkg/*.tar.bz2 pkg/*.xml 2>/dev/null | sed 's/^/   /'
 
-    if [[ -z "$PKG_FILE" ]]; then
-        fail 1 $LINENO "Package was created but no .pkg file was found"
-    fi
-
-    echo "✔ Package created: $PKG_FILE"
-    echo
-    echo "🔑  SHA-256 checksum:"
-    shasum -a 256 "$PKG_FILE"
+    echo "✔ Package created"
+    echo "🔑  SHA-256 checksums:"
+    (
+        cd pkg || exit 1
+        shasum -a 256 *.dmg *.tar.bz2 2>/dev/null
+    )
 }
 
 #######################################
@@ -650,7 +724,9 @@ create_pkg() {
 #######################################
 
 collect_warnings() {
-    [[ "$WARN_LOG" == "1" ]] || return 0
+    if [[ "$WARN_LOG" != "1" ]]; then
+        return
+    fi
 
     echo "▶ Collecting compiler warnings"
 
