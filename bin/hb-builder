@@ -130,6 +130,7 @@ log_build_metadata() {
     echo "Warn level  : ${WARN_LEVEL:-}"
     echo "----------------------------------------"
 }
+log_intro
 
 #######################################
 # Load configuration file
@@ -435,7 +436,6 @@ check_git_updates() {
 }
 
 check_git_updates
-log_intro
 log_build_metadata
 
 #######################################
