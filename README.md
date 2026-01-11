@@ -39,5 +39,6 @@ The script will create a file buildconfig.conf in
 $HOME/Library/Application Support/HandBrakeBuilder
 that can be used to control the behavior of the script.
 
-Note: AI helped create this script. But I have put everything together,
-checked the quality, and tested it several times in different scenarios.
+Note: This project includes original code and code generated with the
+assistance of OpenAI’s ChatGPT. The author reviewed, integrated, and tested
+all components to ensure correctness and reliability.
