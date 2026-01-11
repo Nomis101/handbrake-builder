@@ -2,8 +2,11 @@
 #
 # hb-builder — HandBrake macOS build & notarization helper
 #
-# Copyright (c) 2025 Nomis101
-# Licensed under the MIT License
+# Copyright (c) 2026, Nomis101
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree. 
 #
 # Requires:
 #   - macOS 12+
