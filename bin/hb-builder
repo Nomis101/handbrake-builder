@@ -123,6 +123,7 @@ log_build_metadata() {
     echo "Git branch  : $(git branch --show-current 2>/dev/null || echo n/a)"
     echo "Compiler    : $(clang --version | head -n 1)"
     echo "macOS       : $(sw_vers -productVersion)"
+    echo "Git ref     : ${HB_GIT_REF}"
     echo "Arch        : $(uname -m)"
     echo "SDK         : $(xcrun --show-sdk-version)"
     echo "Notary      : ${NOTARY_ENABLE:-0}"
@@ -178,6 +179,13 @@ load_config() {
 #   DEV_DIR="$HOME/Developer"
 #   DEV_DIR="/Volumes/Developer"
 DEV_DIR="$HOME/Documents"
+
+# Git reference to build
+# Valid values:
+#   - master (default)
+#   - release tags, e.g. 1.10.2
+#   - latest (highest semantic version tag)
+HB_GIT_REF="master"
 
 # Log generation
 # Enable (1) or disable (0) collection of compiler log
@@ -270,6 +278,8 @@ load_config
 #######################################
 
 : "${DEV_DIR:=$HOME/Developer}"
+
+: "${HB_GIT_REF:=master}"
 
 : "${ENABLE_LOG:=}"
 : "${WARN_LOG:=}"
@@ -408,10 +418,6 @@ log_header
 #######################################
 
 check_git_updates() {
-    if [[ "$AUTO_GIT_PULL" != "1" ]]; then
-        echo "ℹ️  AUTO_GIT_PULL disabled"
-        return
-    fi
 
     cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
 
@@ -419,6 +425,21 @@ check_git_updates() {
         echo "ℹ️  Not a Git repository"
         return
     }
+
+    # Check which branch we are currently on
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD)
+
+    # Only run AUTO_GIT_PULL on master
+    if [[ "$current_branch" != "master" ]]; then
+        echo "ℹ️ AUTO_GIT_PULL ignored: currently on '$current_branch' (not master)"
+        return
+    fi
+
+    if [[ "$AUTO_GIT_PULL" != "1" ]]; then
+        echo "ℹ️  AUTO_GIT_PULL disabled"
+        return
+    fi
 
     echo "🔍 Checking Git repository state"
     git fetch --quiet origin
@@ -439,6 +460,114 @@ check_git_updates() {
 }
 
 check_git_updates
+
+#######################################
+# Git reference selection (branch/tag)
+#######################################
+
+select_git_ref() {
+    cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
+
+    local ref="$HB_GIT_REF"
+    local resolved_ref=""
+
+    # Temporarily disable 
+    trap '' ERR
+    echo "🔖 Selecting Git reference: $ref"
+    trap '[[ $? -ne 0 ]] && fail $? $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
+
+    git fetch --all --tags --quiet
+
+    # Determine current ref (branch or tag/detached HEAD)
+    local current_ref
+    current_ref=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || git describe --tags --exact-match HEAD 2>/dev/null || echo "DETACHED")
+
+    # Check whether we really switch
+    local will_switch=0
+    if [[ "$ref" == "master" && "$current_ref" != "master" ]]; then
+        will_switch=1
+    elif git tag -l | grep -qx "$ref" && [[ "$current_ref" != "$ref" ]]; then
+        will_switch=1
+    elif git branch -r | sed 's|origin/||' | grep -E '^[0-9]+\.[0-9]+\.x$' | grep -qx "$ref" && [[ "$current_ref" != "$ref" ]]; then
+        will_switch=1
+    fi
+
+    # Only warn if a ref change is planned
+    if (( will_switch )) && [[ -n "$(git status --porcelain)" ]]; then
+        echo "⚠️  Local changes detected in HandBrake repository!"
+        echo "▶ Showing 'git diff' for review:"
+        git --no-pager diff
+
+        # Create backup patch
+        local backup_dir="$CONFIG_DIR/git-backups"
+        mkdir -p "$backup_dir"
+        local patch_file="$backup_dir/backup-$(date '+%Y%m%d-%H%M%S').patch"
+        git diff > "$patch_file"
+        echo "💾 Backup patch created: $patch_file"
+
+        # Interactive question about stashing
+        read "stash_answer?Do you want to automatically stash these changes before switching Git reference? [y/N]: "
+        if [[ "$stash_answer" =~ ^[Yy]$ ]]; then
+            git stash push -u -m "Auto-stash before switching to $ref"
+            echo "✔ Changes stashed"
+        else
+            echo "❌ Ref switch aborted to prevent data loss"
+            return 1
+        fi
+    fi
+
+    # Resolve "latest"
+    if [[ "$ref" == "latest" ]]; then
+        resolved_ref="$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+        [[ -n "$resolved_ref" ]] || fail 1 $LINENO "Unable to resolve 'latest' – no valid release tags found"
+        echo "✔ Resolved 'latest' to release tag: $resolved_ref"
+        ref="$resolved_ref"
+    fi
+
+    # Tags & Branches
+    trap '' ERR
+    tags=("${(@f)$(git tag -l || true)}")
+    branches=("${(@f)$(git branch -r | sed 's|origin/||' | grep -E '^[0-9]+\.[0-9]+\.x$' || true)}")
+    trap '[[ $? -ne 0 ]] && fail $? $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
+    
+    # Checkout
+    if [[ "$ref" == "master" ]]; then
+        echo "✔ Using default branch: master"
+        git checkout master --quiet
+        git reset --hard origin/master --quiet
+    elif (( ${tags[(Ie)$ref]} )); then
+        echo "✔ Using release tag: $ref"
+        git checkout --detach "$ref" --quiet
+    elif (( ${branches[(Ie)$ref]} )); then
+        echo "✔ Using release branch: $ref"
+        git checkout -B "$ref" "origin/$ref" --quiet
+    else
+        echo
+        echo "❌ Invalid Git reference: $ref"
+        echo
+        echo "Valid tags:"
+        if (( ${#tags[@]} )); then
+            printf '  - %s\n' "${tags[@]}"
+        else
+            echo "  (none found)"
+        fi
+        echo
+        echo "Valid release branches:"
+        if (( ${#branches[@]} )); then
+            printf '  - %s\n' "${branches[@]}"
+        else
+            echo "  (none found)"
+        fi
+        echo
+        echo "Hint:"
+        echo "  - Use a release tag (e.g. 1.10.2) for reproducible builds."
+        echo "  - Use a release branch (e.g. 1.10.x) only if you need the latest fixes."
+        echo
+        fail 1 $LINENO "Invalid Git reference"
+    fi
+}
+
+select_git_ref
 log_build_metadata
 
 #######################################
