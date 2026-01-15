@@ -121,6 +121,7 @@ log_build_metadata() {
     echo "Build metadata"
     echo "Git commit  : $(git rev-parse --short HEAD 2>/dev/null || echo n/a)"
     echo "Git branch  : $(git branch --show-current 2>/dev/null || echo n/a)"
+    echo "Git state   : $(git symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)"
     echo "Compiler    : $(clang --version | head -n 1)"
     echo "macOS       : $(sw_vers -productVersion)"
     echo "Git ref     : ${HB_GIT_REF}"
@@ -464,12 +465,22 @@ check_git_updates
 #######################################
 # Git reference selection (branch/tag)
 #######################################
+is_detached_head() {
+    ! git symbolic-ref -q HEAD >/dev/null
+}
+
+find_latest_auto_stash() {
+    git stash list |
+        grep -m1 '^stash@{[0-9]\+}: Auto-stash before switching to ' |
+        sed 's/:.*//'
+}
 
 select_git_ref() {
     cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
 
     local ref="$HB_GIT_REF"
     local resolved_ref=""
+    local auto_stash=""
 
     # Temporarily disable 
     trap '' ERR
@@ -493,7 +504,7 @@ select_git_ref() {
     fi
 
     # Only warn if a ref change is planned
-    if (( will_switch )) && [[ -n "$(git status --porcelain)" ]]; then
+    if (( will_switch )) && ! is_detached_head && [[ -n "$(git status --porcelain)" ]]; then
         echo "⚠️  Local changes detected in HandBrake repository!"
         echo "▶ Showing 'git diff' for review:"
         git --no-pager diff
@@ -531,10 +542,38 @@ select_git_ref() {
     trap '[[ $? -ne 0 ]] && fail $? $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
     
     # Checkout
-    if [[ "$ref" == "master" ]]; then
-        echo "✔ Using default branch: master"
+if [[ "$ref" == "master" ]]; then
+    if is_detached_head; then
+        echo "🔁 Returning from detached HEAD to master"
         git checkout master --quiet
-        git reset --hard origin/master --quiet
+
+        auto_stash="$(find_latest_auto_stash || true)"
+
+        if [[ -n "$auto_stash" ]]; then
+            echo "💾 Auto-stash detected: $auto_stash"
+            read "restore_answer?Restore previously stashed changes? [y/N]: "
+
+            if [[ "$restore_answer" =~ ^[Yy]$ ]]; then
+                echo "▶ Applying stash"
+                if git stash apply "$auto_stash"; then
+                    git stash drop "$auto_stash"
+                    echo "✔ Stash successfully restored and removed"
+                else
+                    echo "❌ Stash apply failed – conflicts may exist"
+                    echo "ℹ️ Resolve conflicts manually; stash has NOT been dropped"
+                    return 1
+                fi
+            else
+                echo "ℹ️ Stash kept for manual recovery"
+            fi
+        fi
+
+    elif (( will_switch )); then
+        echo "✔ Switching to master"
+        git checkout master --quiet
+    else
+        echo "✔ Staying on master – no ref change needed"
+    fi
     elif (( ${tags[(Ie)$ref]} )); then
         echo "✔ Using release tag: $ref"
         git checkout --detach "$ref" --quiet
@@ -799,7 +838,7 @@ verify_app() {
         stapler validate "$INSTALL_APP" \
             || fail $? $LINENO "stapler validation failed"
     else
-        echo "ℹ️  Skipping Gatekeeper & stapler checks (NOTARY_ENABLE=0)"
+        echo "ℹ️  Notary disabled: Skipping Gatekeeper & stapler checks"
     fi
 }
 
