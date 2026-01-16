@@ -8,6 +8,8 @@ full control over the HandBrake build process while
 remaining compatible with Apple’s modern security
 requirements.
 
+## Features
+
 - Automated end-to-end build of HandBrake from upstream GitHub sources
 - Repository cloning, updating, and clean rebuilds
 - Automatic dependency installation and validation via Homebrew
