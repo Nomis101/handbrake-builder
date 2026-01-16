@@ -77,6 +77,80 @@ validate_environment() {
 }
 
 #######################################
+# Collect build errors
+#######################################
+
+collect_errors() {
+    if [[ "$ERROR_LOG" != "1" ]]; then
+        return
+    fi
+
+    mkdir -p "$LOGDIR"
+    : > "$ERRORLOG"
+
+    sed -E 's/\x1B\[[0-9;]*[mK]//g' "$LOGFILE" 2>/dev/null \
+    | awk '
+    BEGIN {
+        IGNORECASE = 1
+        err = 0
+        done = 0
+    }
+
+    # ---- primary error trigger ----
+    !done && /(^|[[:space:]])(fatal error:|error:|syntaxerror|internal inconsistency error|build interrupted)/ {
+        err = 1
+        done = 1
+        sub(/^[[:space:]]*/, "  : ")
+        print
+        next
+    }
+
+    # ---- allowed continuation lines ----
+    err && /included from/ {
+        sub(/^[[:space:]]*/, "  : ")
+        print
+        next
+    }
+    err && /^[[:space:]]*\|/ {
+        sub(/^[[:space:]]*/, "  : ")
+        print
+        next
+    }
+    err && /^[[:space:]]*\^/ {
+        sub(/^[[:space:]]*/, "  : ")
+        print
+        next
+    }
+    err && /^[[:space:]]*[0-9]+ error generated/ {
+        sub(/^[[:space:]]*/, "  : ")
+        print
+        next
+    }
+    err && /make(\[[0-9]+\])?: \*\*\*/ {
+        sub(/^[[:space:]]*/, "  : ")
+        print
+        next
+    }
+    err && /\*\* BUILD INTERRUPTED \*\*/ {
+        sub(/^[[:space:]]*/, "  : ")
+        print
+        next
+    }
+
+    # ---- hard stop conditions (NO GROUPING!) ----
+    err && /^\/usr\/bin\/gcc/   { err = 0; next }
+    err && /^\/usr\/bin\/clang/ { err = 0; next }
+    err && /^[[:space:]]*cd[[:space:]]/ { err = 0; next }
+    err && /^[[:space:]]*builtin-/ { err = 0; next }
+    err && /^[[:space:]]*ProcessXCFramework/ { err = 0; next }
+    err && /^[[:space:]]*Command ExternalBuildToolExecution/ { err = 0; next }
+
+    ' >> "$ERRORLOG"
+
+    [[ -s "$ERRORLOG" ]] || rm -f "$ERRORLOG"
+}
+
+#######################################
 # Support Functions
 #######################################
 
@@ -84,6 +158,8 @@ fail() {
     local exit_code="${1:-1}"
     local line="${2:-unknown}"
     local cmd="${3:-<no command>}"
+    
+    collect_errors
 
     command -v afplay >/dev/null && afplay /System/Library/Sounds/Funk.aiff || true
     command -v terminal-notifier >/dev/null && /Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier \
@@ -94,6 +170,12 @@ fail() {
     echo "   Exit code : $exit_code"
     echo "   Line      : $line"
     echo "   Command   : $cmd"
+    
+    if [[ -s "$ERRORLOG" ]]; then
+        echo "❌  Error log written:"
+        echo "   → $ERRORLOG"
+        open -R "$ERRORLOG"
+    fi
 
     exit "$exit_code"
 }
@@ -192,6 +274,7 @@ HB_GIT_REF="master"
 # Enable (1) or disable (0) collection of compiler log
 # into a lof file
 ENABLE_LOG=1
+
 # Warning log generation
 # Enable (1) or disable (0) collection of compiler warnings
 # into a separate warnings log file.
@@ -200,6 +283,11 @@ WARN_LOG=
 # Compiler warning verbosity (set from 0 to 2)
 # Higher levels can generate *many* warnings.
 WARN_LEVEL=
+
+# Error log generation
+# Enable (1) or disable (0) collection of build errors
+# into a separate errors log file.
+ERROR_LOG=
 
 # Dependency handling (Homebrew)
 # Automatically update and upgrade Homebrew dependencies
@@ -285,6 +373,7 @@ load_config
 : "${ENABLE_LOG:=}"
 : "${WARN_LOG:=}"
 : "${WARN_LEVEL:=}"
+: "${ERROR_LOG:=}"
 : "${UPDATE_DEPS:=}"
 : "${AUTO_GIT_PULL:=}"
 : "${ADD_CONFIG_OPTS:=}"
@@ -311,6 +400,7 @@ APP_BIN="$BUILD_DIR/xroot/HandBrake.app/Contents/MacOS/HandBrake"
 LOGDIR="$CONFIG_DIR/logs"
 LOGFILE="$LOGDIR/build-$(date '+%Y%m%d-%H%M').log"
 WARNLOG="$LOGDIR/warnings-$(date '+%Y%m%d-%H%M').log"
+ERRORLOG="$LOGDIR/errors-$(date '+%Y%m%d-%H%M').log"
 
 #######################################
 # Check for cargo-c
@@ -405,9 +495,14 @@ log_header() {
     if [[ "$ENABLE_LOG" == "1" ]]; then
         mkdir -p "$LOGDIR"
         find "$LOGDIR" -type f -name 'build-*.log' -mtime +14 -delete || true
-        find "$LOGDIR" -type f \( -name 'build-*.log' -o -name 'warnings-*.log' \) -mtime +14 -delete || true
+        find "$LOGDIR" -type f \( \
+        -name 'build-*.log' \
+        -o -name 'warnings-*.log' \
+        -o -name 'errors-*.log' \
+        \) -mtime +14 -delete || true
         ls -1t "$LOGDIR"/build-*.log(N) | tail -n +50 | xargs -r rm --
         ls -1t "$LOGDIR"/warnings-*.log(N) | tail -n +50 | xargs -r rm --
+        ls -1t "$LOGDIR"/errors-*.log(N) | tail -n +50 | xargs -r rm --
         exec > >(tee -a "$LOGFILE") 2>&1
     fi
 }
