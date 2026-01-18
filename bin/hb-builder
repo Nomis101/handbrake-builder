@@ -180,7 +180,7 @@ fail() {
     exit "$exit_code"
 }
 
-trap '[[ $? -ne 0 ]] && fail $? $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
+trap 'rc=$?; [[ $rc -ne 0 ]] && fail $rc $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
 
 has_command() {
     command -v "$1" >/dev/null 2>&1
@@ -215,6 +215,7 @@ log_build_metadata() {
     echo "Add config  : ${ADD_CONFIG_OPTS:-}"
     echo "Log warnings: ${WARN_LOG:-}"
     echo "Warn level  : ${WARN_LEVEL:-}"
+    echo "Log errors  : ${ERROR_LOG:=}"
     echo "----------------------------------------"
 }
 log_intro
@@ -275,19 +276,19 @@ HB_GIT_REF="master"
 # into a lof file
 ENABLE_LOG=1
 
-# Warning log generation
-# Enable (1) or disable (0) collection of compiler warnings
-# into a separate warnings log file.
-WARN_LOG=
+# Error log generation
+# Enable (1) or disable (0) collection of build errors
+# into a separate errors log file.
+ERROR_LOG=
 
 # Compiler warning verbosity (set from 0 to 2)
 # Higher levels can generate *many* warnings.
 WARN_LEVEL=
 
-# Error log generation
-# Enable (1) or disable (0) collection of build errors
-# into a separate errors log file.
-ERROR_LOG=
+# Warning log generation
+# Enable (1) or disable (0) collection of compiler warnings
+# into a separate warnings log file.
+WARN_LOG=
 
 # Dependency handling (Homebrew)
 # Automatically update and upgrade Homebrew dependencies
@@ -298,6 +299,9 @@ UPDATE_DEPS=
 # If set to 1, automatically pull new commits from the HandBrake Git
 # repository if the local branch is behind the upstream.
 AUTO_GIT_PULL=
+
+# Auto apply patches located in the patch folder
+APPLY_PATCHES=
 
 # Additional configure options
 # Extra options appended to ./configure.
@@ -378,6 +382,7 @@ load_config
 : "${AUTO_GIT_PULL:=}"
 : "${ADD_CONFIG_OPTS:=}"
 : "${MAKE_INSTALLER:=}"
+: "${APPLY_PATCHES:=}"
 
 : "${NOTARY_ENABLE:=0}"
 : "${NOTARY_USERNAME:=}"
@@ -395,12 +400,22 @@ validate_environment
 
 ROOT="$DEV_DIR/HandBrake"
 BUILD_DIR="$ROOT/build"
+LOGDIR="$CONFIG_DIR/logs"
+BACKUPDIR="$CONFIG_DIR/git-backups"
 INSTALL_APP="/Applications/HandBrake.app"
 APP_BIN="$BUILD_DIR/xroot/HandBrake.app/Contents/MacOS/HandBrake"
-LOGDIR="$CONFIG_DIR/logs"
+PATCHDIR="$CONFIG_DIR/patches"
 LOGFILE="$LOGDIR/build-$(date '+%Y%m%d-%H%M').log"
 WARNLOG="$LOGDIR/warnings-$(date '+%Y%m%d-%H%M').log"
 ERRORLOG="$LOGDIR/errors-$(date '+%Y%m%d-%H%M').log"
+
+#######################################
+# Create all needed subfolders
+#######################################
+
+mkdir -p "$LOGDIR"
+mkdir -p "$BACKUPDIR"
+mkdir -p "$PATCHDIR"
 
 #######################################
 # Check for cargo-c
@@ -493,7 +508,6 @@ fi
 
 log_header() {
     if [[ "$ENABLE_LOG" == "1" ]]; then
-        mkdir -p "$LOGDIR"
         find "$LOGDIR" -type f -name 'build-*.log' -mtime +14 -delete || true
         find "$LOGDIR" -type f \( \
         -name 'build-*.log' \
@@ -605,8 +619,7 @@ select_git_ref() {
         git --no-pager diff
 
         # Create backup patch
-        local backup_dir="$CONFIG_DIR/git-backups"
-        mkdir -p "$backup_dir"
+        local backup_dir="$BACKUPDIR"
         local patch_file="$backup_dir/backup-$(date '+%Y%m%d-%H%M%S').patch"
         git diff > "$patch_file"
         echo "💾 Backup patch created: $patch_file"
@@ -774,6 +787,159 @@ install_deps() {
 install_deps
 
 #######################################
+# Patch state setup
+#######################################
+
+# File to track applied patches
+PATCH_STATE_FILE="$PATCHDIR/applied_patches"
+
+#######################################
+# Apply Patch (idempotent)
+#######################################
+
+apply_patches() {
+    # Skip if disabled
+    if [[ "${APPLY_PATCHES:-0}" != "1" ]]; then
+        return
+    fi
+
+    # Skip if PATCHDIR missing or empty
+    if [[ ! -d "$PATCHDIR" ]]; then
+        echo "ℹ️  Patch directory not found – skipping patches"
+        return
+    fi
+    
+    # Collect patches
+    local patches
+    patches=("$PATCHDIR"/*.patch(N))
+
+    if (( ${#patches} == 0 )); then
+        echo "ℹ️  No patches found – nothing to apply"
+    else
+
+    echo "----------------------------------------"
+    echo "▶ Applying patches"
+
+    touch "$PATCH_STATE_FILE"
+    
+    typeset -A applied
+    local record
+
+    # Load applied patches into memory
+    while IFS= read -r record || [[ -n "$record" ]]; do
+    record="${record//$'\r'/}"
+
+    # Trim whitespace
+    record="${record##[[:space:]]#}"
+    record="${record%%[[:space:]]#}"
+
+    # Remove ALL quotes, defensiv
+    record="${record//\"/}"
+
+    # Strict validation
+    [[ "$record" == [A-Za-z0-9._-]##.patch:* ]] || {
+        echo "⚠️  Ignoring invalid patch state entry: $record"
+        continue
+    }
+
+    applied["$record"]=1
+done < "$PATCH_STATE_FILE"
+    
+# Detect deleted patches referenced in state
+    local patch_name
+    for record in "${(@k)applied[@]}"; do  
+    record="${record//\"/}"
+    patch_name="${record%%:*}"
+    patch_path="${PATCHDIR}/${patch_name}"
+
+    if [[ ! -f "$patch_path" ]]; then
+        echo "⚠️  Patch state references missing patch: $patch_name"
+
+            if [[ -t 0 ]]; then
+                read "ans?Remove stale state entry? [y/N]: "
+                if [[ "$ans" =~ ^[Yy]$ ]]; then
+                    sed -i '' "\|^$record\$|d" "$PATCH_STATE_FILE"
+                    unset "applied[$record]"
+                    echo "✔ Removed stale patch state"
+                else
+                    fail 1 $LINENO "Stale patch state detected"
+                fi
+            else
+                fail 1 $LINENO "Stale patch state detected (non-interactive)"
+            fi
+        fi
+    done
+
+    # Apply patches
+    local patch checksum key changed=0
+
+    cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
+
+    for patch in "${patches[@]}"; do
+    patch="${patch}"
+    checksum=$(shasum -a 256 "$patch" | awk '{print $1}')
+    key="$(basename "$patch"):$checksum"
+
+    if [[ -n "${applied[$key]-}" ]]; then
+        echo "✔ Patch already applied: $(basename "$patch")"
+        continue
+    fi
+
+    echo "  → Applying $(basename "$patch")"
+   if patch --dry-run --forward -p1 < "$patch" >/dev/null 2>&1; then
+        echo "  → Applying $(basename "$patch")"
+        if ! patch --forward --batch -p1 < "$patch"; then
+            echo "⚠️  Patch partially failed or conflicts detected: $(basename "$patch")"
+        fi
+    else
+        echo "✔ Patch already present in source: $(basename "$patch")"
+    fi
+
+    echo "$key" >> "$PATCH_STATE_FILE"
+    applied["$key"]=1
+    changed=1
+done
+fi
+
+if [[ ! -w "$PATCHDIR" ]]; then
+    echo "⚠️  Patch directory not writable – cannot create patches"
+fi
+
+    # Detect unpatched local modifications
+    if (( changed == 0 )); then
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        if ! git diff --quiet; then
+            echo "⚠️  Source tree contains unpatched local changes"
+
+            if [[ ! -w "$PATCHDIR" ]]; then
+                echo "⚠️  Patch directory not writable – cannot create patches"
+            elif [[ -t 0 ]]; then
+                read "ans?Create a new patch from these changes? [y/N]: "
+                if [[ "$ans" =~ ^[Yy]$ ]]; then
+                    local ts patchfile
+                    ts=$(date '+%Y%m%d-%H%M%S')
+                    patchfile="$PATCHDIR/local-$ts.patch"
+
+                    git diff > "$patchfile"
+                    echo "✔ Patch created: $(basename "$patchfile")"
+                    echo "ℹ️  Patch will be applied on next run"
+                fi
+            else
+                echo "ℹ️  Non-interactive mode – patch creation skipped"
+            fi
+        fi
+    fi
+fi
+
+    # Summary
+    if (( changed )); then
+        echo "✔ Patches successfully applied"
+    else
+        echo "✔ All patches already applied"
+    fi
+}
+
+#######################################
 # Clean
 #######################################
 
@@ -798,6 +964,7 @@ configure_handbrake() {
 
 echo "▶ ./configure options:"
 echo "   --launch-jobs=$JOBS --launch $ADD_CONFIG_OPTS"
+git diff --quiet || echo "⚠️  Building from modified sources"
 
 typeset -a CONFIG_OPTS
 CONFIG_OPTS=(${(z)${ADD_CONFIG_OPTS:-}})
@@ -829,6 +996,7 @@ build_handbrake() {
 
 }
 
+apply_patches
 configure_handbrake
 build_handbrake
 
