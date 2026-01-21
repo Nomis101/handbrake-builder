@@ -1,0 +1,860 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+#######################################
+# Functional Test Input Assets
+#
+# All files must be SHORT (5–15 seconds),
+# visually simple, and deterministic.
+#
+# Directory layout:
+#   $TEST_DIR/inputs/
+#######################################
+
+# --- REQUIRED INPUT FILES ---
+
+# sdr_1080p.mp4
+# 1920x1080 | SDR | BT.709 | yuv420p | H.264 video | AAC audio
+#
+# hevc_hdr10.mkv
+# 3840x2160 | HDR10 | BT.2020 | PQ | 10-bit | HEVC | static metadata
+#
+# hdr10plus_4k.mp4
+# 3840x2160 | HDR10+ | BT.2020 | PQ | dynamic metadata (SMPTE 2094-40)
+#
+# dolby_vision_1080p.mkv
+# 1920x1080 | Dolby Vision | Profile 5 or 8.1 | RPU metadata present
+#
+# audio_5.1.mkv
+# 1920x1080 | SDR | 5.1 discrete audio | AAC / FLAC | channel-test content
+#
+# ft07_subs.mkv
+# 1920x1080 | SDR | text subtitles (SRT/SSA) | known visible cues
+#######################################
+
+
+#######################################
+# Paths
+#######################################
+
+ROOT="$HOME/Library/Application Support/HandBrakeBuilder"
+TEST_DIR="$ROOT/tests"
+INPUT="$TEST_DIR/inputs"
+OUTPUT="$TEST_DIR/outputs"
+
+mkdir -p "$TEST_DIR"
+mkdir -p "$INPUT"
+mkdir -p "$OUTPUT"
+
+#######################################
+# Framework and Helper
+#######################################
+
+current_test=""
+
+fail() {
+    TEST_RESULTS[$current_test]="FAIL"
+    TEST_MESSAGES[$current_test]="$1"
+    print "❌ FAIL: $1"
+    return 1
+}
+
+pass() {
+    TEST_RESULTS[$current_test]="PASS"
+    return 0
+}
+
+skip() {
+    TEST_RESULTS[$current_test]="SKIP"
+    TEST_MESSAGES[$current_test]="$1"
+    print "⚠ SKIP: $1"
+    return 0
+}
+
+require() {
+    command -v "$1" >/dev/null 2>&1 || fail "Missing tool: $1"
+}
+
+assert_file() {
+    [[ -f "$1" ]] || fail "Missing file: $1"
+    [[ -s "$1" ]] || fail "Empty file: $1"
+}
+
+run_test() {
+    local test_id="$1"
+    shift
+
+    TEST_ORDER+=("$test_id")
+    current_test="$test_id"
+
+    print "▶ $test_id"
+
+   if "$@"; then
+        # Prüfe nochmal, ob die TEST_RESULTS von der Funktion gesetzt wurde
+        [[ -z "${TEST_RESULTS[$test_id]}" ]] && TEST_RESULTS[$test_id]="PASS"
+    else
+        [[ -z "${TEST_RESULTS[$test_id]}" ]] && TEST_RESULTS[$test_id]="FAIL"
+    fi
+}
+
+#######################################
+# Tracking
+#######################################
+
+typeset -A TEST_RESULTS
+typeset -A TEST_MESSAGES
+typeset -a TEST_ORDER
+
+#######################################
+# Environment check
+#######################################
+
+validate_env() {
+    for t in HandBrakeCLI ffprobe jq mediainfo; do
+        require "$t"
+    done
+
+    mkdir -p "$OUTPUT"
+    rm -f "$OUTPUT"/*(N)
+}
+
+#######################################
+# Validate inputs
+#######################################
+
+validate_inputs() {
+    local files=(
+        sdr_1080p.mp4
+        hevc_hdr10.mkv
+        hdr10plus_4k.mp4
+        dolby_vision_1080p.mkv
+        audio_5.1.mkv
+        ft07_subs.mkv
+    )
+
+    for f in $files; do
+        assert_file "$INPUT/$f"
+    done
+}
+
+#######################################
+# FT-01: H.264 SDR
+#######################################
+
+test_h264_sdr() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft01_h264_sdr.mkv"
+    local probe
+
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e x264 --encoder-preset veryfast \
+        --audio 1 --aencoder copy \
+        --subtitle none >/dev/null 2>&1; then
+        fail "FT-01: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+    
+    probe=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,pix_fmt,color_transfer \
+        -of json "$out")
+
+    if ! echo "$probe" | jq -e '
+        .streams[0].codec_name=="h264" and
+        .streams[0].pix_fmt=="yuv420p" and
+        (.streams[0].color_transfer==null or .streams[0].color_transfer=="bt709")
+    ' >/dev/null; then
+        echo "Actual stream metadata:"
+        echo "$probe" | jq '.streams[0]'
+        fail "FT-01: Invalid H.264 SDR stream"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-02: HEVC SDR
+#######################################
+
+test_hevc_sdr() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft02_hevc_sdr.mkv"
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e x265 --encoder-profile main \
+        --audio 1 --aencoder copy \
+        --subtitle none >/dev/null 2>&1; then
+        fail "FT-02: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,pix_fmt \
+        -of json "$out" | jq -e '
+            .streams[0].codec_name=="hevc" and
+            .streams[0].pix_fmt=="yuv420p"
+        ' >/dev/null; then
+        fail "FT-02: Invalid HEVC SDR stream"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-03: HEVC HDR10 (baseline)
+#######################################
+
+test_hevc_hdr10() {
+    local in="$INPUT/hevc_hdr10.mkv"
+    local out="$OUTPUT/ft03_ahevc_hdr10.mkv"
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+       -e x265 --encoder-profile main10 \
+       --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+       fail "FT-03: encoder crashed or returned non-zero exit code"
+       return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams v:0 \
+        -show_entries stream=pix_fmt,color_primaries,color_transfer \
+        -of json "$out" | jq -e '
+            .streams[0].pix_fmt=="yuv420p" and
+            .streams[0].color_primaries=="bt2020" and
+            .streams[0].color_transfer=="smpte2084"
+        ' >/dev/null; then
+        fail "FT-03: Invalid HDR10 stream"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-04: AV1 SDR
+#######################################
+
+test_av1_sdr() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft04_av1_sdr.mkv"
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e svt_av1 --encoder-preset 8 \
+        --audio 1 --aencoder copy \
+        --subtitle none >/dev/null 2>&1; then
+        fail "FT-04: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,pix_fmt \
+        -of json "$out" | jq -e '
+            .streams[0].codec_name=="av1"
+        ' >/dev/null; then
+        fail "FT-04: Invalid AV1 SDR stream"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-05: AV1 4K HDR10
+#######################################
+
+test_av1_hdr10_4k() {
+    local in="$INPUT/hevc_hdr10.mkv"
+    local out="$OUTPUT/ft05_av1_hdr10_4k.mkv"
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e svt_av1_10bit --encoder-preset 10 \
+        --audio 1 --aencoder copy \
+        --subtitle none >/dev/null 2>&1; then
+        fail "FT-05: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,pix_fmt,color_primaries,color_transfer,width,height \
+        -of json "$out" | jq -e '
+            .streams[0].codec_name=="av1" and
+            .streams[0].pix_fmt=="yuv420p10le" and
+            .streams[0].color_primaries=="bt2020" and
+            .streams[0].color_transfer=="smpte2084" and
+            .streams[0].width>=3840
+        ' >/dev/null; then
+        fail "FT-05: Invalid AV1 4K HDR10 stream"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-06: Audio Downmix
+#######################################
+
+test_audio_downmix() {
+    local in="$INPUT/audio_5.1.mkv"
+    local out="$OUTPUT/ft06_audio_downmix.mkv"
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        --audio 1 --aencoder aac --mixdown stereo \
+        --subtitle none >/dev/null 2>&1; then
+        fail "FT-06: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams a:0 \
+        -show_entries stream=channels \
+        -of json "$out" | jq -e '
+            .streams[0].channels==2
+        ' >/dev/null; then
+        fail "FT-06: Audio not downmixed"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-07: Subtitle Passthrough
+#######################################
+
+test_subtitles() {
+    local in="$INPUT/ft07_subs.mkv"
+    local out="$OUTPUT/ft07_subs_out.mkv"
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        --subtitle 1 --subtitle-burned=none \
+        --audio 1 --aencoder copy >/dev/null 2>&1; then
+        fail "FT-07: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams s \
+        -show_entries stream=index \
+        -of json "$out" | jq -e '
+            .streams | length > 0
+        ' >/dev/null; then
+        fail "FT-07: Subtitle missing"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-08: HEVC HDR10+ (dynamic metadata)
+#######################################
+
+test_hevc_hdr10plus() {
+    local in="$INPUT/hdr10plus_4k.mp4"
+    local out="$OUTPUT/ft08_hevc_hdr10plus.mkv"
+
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e x265_10bit --encoder-profile main10 --format mkv \
+        --hdr-dynamic-metadata hdr10plus \
+        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        fail "FT-08: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    local hdr
+    hdr=$(mediainfo --Output=JSON "$out" | jq -r '
+        .media.track[]
+        | select(."@type"=="Video")
+        | (.HDR_Format // "") + " " + (.HDR_Format_Compatibility // "")
+    ')
+
+    if [[ "$hdr" != *"ST 2094 App 4"* ]]; then
+        echo "Actual HDR metadata: $hdr"
+        fail "FT-08: HDR10+ metadata missing (SMPTE ST 2094 App 4 not found)"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-09: Dolby Vision
+#######################################
+
+test_dolby_vision() {
+    local in="$INPUT/dolby_vision_1080p.mkv"
+    local out="$OUTPUT/ft09_dolby_vision.mkv"
+
+    assert_file "$in"
+
+    mediainfo "$in" | grep -qi "dolby vision" || {
+        skip "Input has no Dolby Vision metadata"
+        return
+    }
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e x265_10bit --encoder-profile main10 \
+        --hdr-dynamic-metadata dolbyvision \
+        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        fail "FT-09: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    local dv
+    dv=$(mediainfo --Output=JSON "$out" | jq -r '
+        .media.track[]
+        | select(."@type"=="Video")
+        | (
+            .HDR_Format // "" + " " +
+            .HDR_Format_Profile // "" + " " +
+            .HDR_Format_Compatibility // ""
+        )
+    ')
+
+    if [[ "$dv" != *"dv"* ]] && [[ "$dv" != *"Dolby Vision"* ]]; then
+        echo "Actual HDR metadata: $dv"
+        fail "FT-09: Dolby Vision metadata missing"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-10: MPEG2
+#######################################
+
+test_mpeg2_sdr() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft10_mpeg2_sdr.mkv"
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e mpeg2 --format mkv \
+        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        fail "FT-10: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name \
+        -of json "$out" | jq -e '
+            .streams[0].codec_name=="mpeg2video"
+        ' >/dev/null; then
+        fail "FT-10: MPEG-2 encode failed"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-11: MPEG4
+#######################################
+
+test_mpeg4() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft11_mpeg4.mp4"
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e mpeg4 --format mp4 \
+        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        fail "FT-11: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name \
+        -of json "$out" | jq -e '
+            .streams[0].codec_name=="mpeg4"
+        ' >/dev/null; then
+        fail "FT-11: MPEG-4 encode failed"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-12: FFV1
+#######################################
+
+test_ffv1() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft12_ffv1.mkv"
+
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e ffv1 --format mkv --encoder-level 3 \
+        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        fail "FT-12: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+    
+    assert_file "$out"
+
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "FT-12: Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name \
+        -of json "$out" | jq -e '.streams[0].codec_name=="ffv1"' >/dev/null; then
+        fail "FT-12: FFV1 encode failed"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-13: H.264 Videotoolbox
+#######################################
+
+test_h264_vt() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft13_h264_vt.mp4"
+    local probe
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e vt_h264 --format mp4 \
+        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        fail "FT-13: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+    
+    probe=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,pix_fmt,color_transfer \
+        -of json "$out")
+        
+    if ! echo "$probe" | jq -e '
+        .streams[0].codec_name=="h264" and
+        .streams[0].pix_fmt=="yuv420p" and
+        (.streams[0].color_transfer==null or .streams[0].color_transfer=="bt709")
+    ' >/dev/null; then
+        echo "Actual stream metadata:"
+        echo "$probe" | jq '.streams[0]'
+        fail "FT-13: Invalid H.264 SDR stream"
+        return 1
+    fi
+  
+    pass
+}
+
+#######################################
+# FT-14: H.265 Videotoolbox
+#######################################
+
+test_h265_vt() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft14_h265_vt.mp4"
+    local probe
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e vt_h265 --format mp4 \
+        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        fail "FT-14: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+    
+    probe=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,pix_fmt,color_transfer \
+        -of json "$out")
+        
+    if ! echo "$probe" | jq -e '
+        .streams[0].codec_name=="hevc" and
+        .streams[0].pix_fmt=="yuv420p" and
+        (.streams[0].color_transfer==null or .streams[0].color_transfer=="bt709")
+    ' >/dev/null; then
+        echo "Actual stream metadata:"
+        echo "$probe" | jq '.streams[0]'
+        fail "FT-14: Invalid H.265 SDR stream"
+        return 1
+    fi
+  
+    pass
+}
+
+#######################################
+# FT-15: H.265 10-bit Videotoolbox
+#######################################
+
+test_h265_vt_10bit() {
+    local in="$INPUT/hevc_hdr10.mkv"
+    local out="$OUTPUT/ft15_h265_vt_10bit.mp4"
+    local probe
+    
+    assert_file "$in"
+
+   if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e vt_h265_10bit --format mp4 \
+        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        fail "FT-15: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+    
+    probe=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,pix_fmt,color_transfer \
+        -of json "$out")
+        
+    if ! echo "$probe" | jq -e '
+        .streams[0].codec_name=="hevc" and
+        .streams[0].pix_fmt=="yuv420p10le" and
+        (.streams[0].color_transfer==null or .streams[0].color_transfer=="smpte2084")
+    ' >/dev/null; then
+        echo "Actual stream metadata:"
+        echo "$probe" | jq '.streams[0]'
+        fail "FT-15: Invalid H.265 SDR stream"
+        return 1
+    fi
+  
+    pass
+}
+
+#######################################
+# FT-16: VP9
+#######################################
+
+test_vp9_mp4() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft16_vp9.mp4"
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e vp9 --format mp4 \
+        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        fail "FT-16: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name \
+        -of json "$out" | jq -e '
+            .streams[0].codec_name=="vp9"
+        ' >/dev/null; then
+        fail "FT-16: VP9 encode failed"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-17: Theora (MKV)
+#######################################
+
+test_theora() {
+    local in="$INPUT/sdr_1080p.mp4" 
+    local out="$OUTPUT/ft17_theora.mkv"
+    
+    assert_file "$in"
+
+    if ! HandBrakeCLI -i "$in" -o "$out" \
+        -e theora --format mkv \
+        --audio none --subtitle none >/dev/null 2>&1; then
+        fail "FT-17: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out"
+    
+    if [[ ! -f "$out" || ! -s "$out" ]]; then
+        fail "Output file not created"
+        return 1
+    fi
+
+    if ! ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name \
+        -of json "$out" | jq -e '
+            .streams[0].codec_name=="theora"
+        ' >/dev/null; then
+        fail "FT-17: Theora encode failed"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# Main
+#######################################
+
+main() {
+    print "======================================"
+    print " HandBrake Functional Test Suite (zsh)"
+    print "======================================"
+
+    validate_inputs
+    validate_env
+
+    run_test "FT-01 H.264 SDR"          test_h264_sdr
+    run_test "FT-02 HEVC SDR"           test_hevc_sdr
+    run_test "FT-03 HEVC HDR10"         test_hevc_hdr10
+    run_test "FT-04 AV1 SDR"            test_av1_sdr
+    run_test "FT-05 AV1 HDR10 4K"       test_av1_hdr10_4k
+    run_test "FT-06 Audio Downmix"      test_audio_downmix
+    run_test "FT-07 Subtitles"          test_subtitles
+    run_test "FT-08 HEVC HDR10+"        test_hevc_hdr10plus
+    run_test "FT-09 Dolby Vision"       test_dolby_vision
+    run_test "FT-10 MPEG-2"             test_mpeg2_sdr
+    run_test "FT-11 MPEG-4"             test_mpeg4
+    run_test "FT-12 FFV1"               test_ffv1
+    run_test "FT-13 H.264 VT"           test_h264_vt
+    run_test "FT-14 H.265 VT"           test_h265_vt
+    run_test "FT-15 H.265 VT 10-bit"    test_h265_vt_10bit
+    run_test "FT-16 VP9"                test_vp9_mp4
+    run_test "FT-17 Theora"             test_theora
+
+    print "\n======================================"
+print " TEST SUMMARY"
+print "======================================"
+
+local failed=0
+
+for t in "${TEST_ORDER[@]}"; do
+    printf "%-25s : %s\n" "$t" "${TEST_RESULTS[$t]}"
+    [[ "${TEST_RESULTS[$t]}" == "FAIL" ]] && failed=1
+done
+
+print "======================================"
+
+if [[ $failed -eq 0 ]]; then
+    print "✔ ALL TESTS PASSED"
+else
+    print "❌ SOME TESTS FAILED"
+fi
+
+return $failed
+    }
+
+main "$@"

@@ -303,6 +303,10 @@ AUTO_GIT_PULL=
 # Auto apply patches located in the patch folder
 APPLY_PATCHES=
 
+# Activate functional test at the end of the build process
+# to function test the build
+FUNCTIONAL_TEST=
+
 # Additional configure options
 # Extra options appended to ./configure.
 # Example:
@@ -383,6 +387,7 @@ load_config
 : "${ADD_CONFIG_OPTS:=}"
 : "${MAKE_INSTALLER:=}"
 : "${APPLY_PATCHES:=}"
+: "${FUNCTIONAL_TEST:=}"
 
 : "${NOTARY_ENABLE:=0}"
 : "${NOTARY_USERNAME:=}"
@@ -514,9 +519,17 @@ log_header() {
         -o -name 'warnings-*.log' \
         -o -name 'errors-*.log' \
         \) -mtime +14 -delete || true
-        ls -1t "$LOGDIR"/build-*.log(N) | tail -n +50 | xargs -r rm --
-        ls -1t "$LOGDIR"/warnings-*.log(N) | tail -n +50 | xargs -r rm --
-        ls -1t "$LOGDIR"/errors-*.log(N) | tail -n +50 | xargs -r rm --
+        
+        local files
+
+        files=("$LOGDIR"/build-*.log(Nom))
+        (( ${#files} > 49 )) && rm -f -- "${files[50,-1]}"
+
+        files=("$LOGDIR"/warnings-*.log(Nom))
+        (( ${#files} > 49 )) && rm -f -- "${files[50,-1]}"
+
+        files=("$LOGDIR"/errors-*.log(Nom))
+        (( ${#files} > 49 )) && rm -f -- "${files[50,-1]}"
         exec > >(tee -a "$LOGFILE") 2>&1
     fi
 }
@@ -876,7 +889,6 @@ done < "$PATCH_STATE_FILE"
     cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
 
     for patch in "${patches[@]}"; do
-    patch="${patch}"
     checksum=$(shasum -a 256 "$patch" | awk '{print $1}')
     key="$(basename "$patch"):$checksum"
 
@@ -885,7 +897,6 @@ done < "$PATCH_STATE_FILE"
         continue
     fi
 
-    echo "  → Applying $(basename "$patch")"
    if patch --dry-run --forward -p1 < "$patch" >/dev/null 2>&1; then
         echo "  → Applying $(basename "$patch")"
         if ! patch --forward --batch -p1 < "$patch"; then
@@ -895,9 +906,8 @@ done < "$PATCH_STATE_FILE"
         echo "✔ Patch already present in source: $(basename "$patch")"
     fi
 
-    echo "$key" >> "$PATCH_STATE_FILE"
+    grep -qxF "$key" "$PATCH_STATE_FILE" || echo "$key" >> "$PATCH_STATE_FILE"
     applied["$key"]=1
-    changed=1
 done
 fi
 
@@ -1203,6 +1213,31 @@ warn && /(^|[[:space:]])note:/ {
     fi
 }
 
+#######################################
+# Functional test
+#######################################
+
+functional_test() {
+    if [[ "${FUNCTIONAL_TEST:-0}" != "1" ]]; then
+        echo "ℹ️  Functional tests disabled – skipping"
+        return
+    fi
+
+    if ! command -v hb-test >/dev/null 2>&1; then
+        fail 1 $LINENO "Functional test binary not found in PATH: hb-test"
+    fi
+
+    echo "----------------------------------------"
+    echo "▶ Running functional tests"
+
+    if ! hb-test; then
+        fail 1 $LINENO "Functional tests failed"
+    fi
+
+    echo "✔ Functional tests passed"
+}
+
 collect_warnings
 create_pkg
+functional_test
 exit 0
