@@ -513,12 +513,12 @@ fi
 
 log_header() {
     if [[ "$ENABLE_LOG" == "1" ]]; then
-        find "$LOGDIR" -type f -name 'build-*.log' -mtime +14 -delete || true
+        find "$LOGDIR" -type f -name 'build-*.log' -mtime +14 -exec rm -f {} \; || true
         find "$LOGDIR" -type f \( \
         -name 'build-*.log' \
         -o -name 'warnings-*.log' \
         -o -name 'errors-*.log' \
-        \) -mtime +14 -delete || true
+        \) -mtime +14 -exec rm -f {} \; || true
         
         local files
 
