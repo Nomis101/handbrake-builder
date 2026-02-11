@@ -19,6 +19,9 @@ IFS=$'\n\t'
 setopt EXTENDED_GLOB
 umask 077
 
+# Security: sanitize PATH to prevent execution of attacker-planted binaries
+PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 #######################################
 # Location for buildconfig.conf file
 #######################################
@@ -175,7 +178,7 @@ fail() {
     if [[ -s "$ERRORLOG" ]]; then
         echo "❌  Error log written:"
         echo "   → $ERRORLOG"
-        open -R "$ERRORLOG"
+        [[ -t 1 ]] && open -R "$ERRORLOG"
     fi
 
     exit "$exit_code"
@@ -237,8 +240,12 @@ load_config() {
         if (( 8#$_cfg_mode & 8#022 )); then
             fail 1 $LINENO "Config file is group/world-writable (mode $_cfg_mode): $CONFIG_FILE"
         fi
+        # Security: copy to temp file and source the copy to eliminate TOCTOU window
+        _VALIDATED_CONFIG=$(mktemp "${TMPDIR:-/tmp}/hb-config.XXXXXX")
+        cp "$CONFIG_FILE" "$_VALIDATED_CONFIG"
+        chmod 0600 "$_VALIDATED_CONFIG"
         echo "✔ Configuration file found – loading"
-        source "$CONFIG_FILE"
+        source "$_VALIDATED_CONFIG"
     else
         echo "ℹ️  No configuration file found:"
         echo "   $CONFIG_FILE"
@@ -256,7 +263,8 @@ load_config() {
                     echo "⚠️  DEV_DIR was empty – setting to $DEV_DIR"
                 fi
 
-                # Write template to DEV_DIR
+                # Write template with restricted permissions
+                install -m 0600 /dev/null "$CONFIG_FILE"
                 cat <<'EOF' > "$CONFIG_FILE"
 # ============================================================
 # HandBrake Builder – buildconfig.conf
@@ -388,8 +396,12 @@ load_config
 # Security: clear sensitive variables to prevent environment injection
 unset ADD_CONFIG_OPTS CFLAGS CXXFLAGS OBJCFLAGS OBJCXXFLAGS 2>/dev/null || true
 
-# Re-source config to set variables (already validated above)
-[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+# Re-source validated config copy to set variables (never re-read the original)
+if [[ -n "${_VALIDATED_CONFIG:-}" && -f "$_VALIDATED_CONFIG" ]]; then
+    source "$_VALIDATED_CONFIG"
+    rm -f "$_VALIDATED_CONFIG"
+    unset _VALIDATED_CONFIG
+fi
 
 : "${DEV_DIR:=$HOME/Developer}"
 
@@ -435,19 +447,17 @@ ERRORLOG="$LOGDIR/errors-$(date '+%Y%m%d-%H%M').log"
 # Create all needed subfolders
 #######################################
 
-# Security: verify paths are not symlinks before creating directories
+# Security: create directories then verify they are not symlinks (post-creation check)
 for _dir in "$CONFIG_DIR" "$LOGDIR" "$BACKUPDIR" "$PATCHDIR"; do
     if [[ -L "$_dir" ]]; then
         fail 1 $LINENO "Directory path is a symlink (possible attack): $_dir"
     fi
+    mkdir -p "$_dir"
+    chmod 0700 "$_dir"
+    if [[ -L "$_dir" ]]; then
+        fail 1 $LINENO "Directory became a symlink after creation (race detected): $_dir"
+    fi
 done
-
-mkdir -p "$LOGDIR"
-chmod 0700 "$LOGDIR"
-mkdir -p "$BACKUPDIR"
-chmod 0700 "$BACKUPDIR"
-mkdir -p "$PATCHDIR"
-chmod 0700 "$PATCHDIR"
 
 #######################################
 # Check for cargo-c
@@ -460,7 +470,17 @@ install_cargo_c() {
         local _rustup_installer
         _rustup_installer=$(mktemp "${TMPDIR:-/tmp}/rustup-init.XXXXXX")
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$_rustup_installer"
-        echo "⚠️  Downloaded rustup installer — SHA-256: $(shasum -a 256 "$_rustup_installer" | awk '{print $1}')"
+        local _rustup_hash
+        _rustup_hash=$(shasum -a 256 "$_rustup_installer" | awk '{print $1}')
+        echo "⚠️  Downloaded rustup installer — SHA-256: $_rustup_hash"
+        echo "   Verify this hash at https://rustup.rs before continuing."
+        if [[ -t 0 ]]; then
+            read "rust_answer?Proceed with rustup installation? [y/N]: "
+            if [[ ! "$rust_answer" =~ ^[Yy]$ ]]; then
+                rm -f "$_rustup_installer"
+                fail 1 $LINENO "Rustup installation aborted by user"
+            fi
+        fi
         chmod +x "$_rustup_installer"
         "$_rustup_installer" -y
         rm -f "$_rustup_installer"
@@ -486,7 +506,19 @@ if ! has_command brew; then
     local _brew_installer
     _brew_installer=$(mktemp "${TMPDIR:-/tmp}/brew-install.XXXXXX")
     curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$_brew_installer"
-    echo "⚠️  Downloaded Homebrew installer — SHA-256: $(shasum -a 256 "$_brew_installer" | awk '{print $1}')"
+    local _brew_hash
+    _brew_hash=$(shasum -a 256 "$_brew_installer" | awk '{print $1}')
+    echo "⚠️  Downloaded Homebrew installer — SHA-256: $_brew_hash"
+    echo "   Verify this hash at https://github.com/Homebrew/install before continuing."
+    if [[ -t 0 ]]; then
+        read "brew_answer?Proceed with Homebrew installation? [y/N]: "
+        if [[ ! "$brew_answer" =~ ^[Yy]$ ]]; then
+            rm -f "$_brew_installer"
+            fail 1 $LINENO "Homebrew installation aborted by user"
+        fi
+    else
+        fail 1 $LINENO "Homebrew install requires interactive confirmation"
+    fi
     /bin/bash "$_brew_installer"
     rm -f "$_brew_installer"
     # Set up brew environment using explicit PATH instead of eval
@@ -650,10 +682,7 @@ select_git_ref() {
         fail 1 $LINENO "Invalid characters in HB_GIT_REF: $ref"
     fi
 
-    # Temporarily disable
-    trap '' ERR
     echo "🔖 Selecting Git reference: $ref"
-    trap '[[ $? -ne 0 ]] && fail $? $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
 
     git fetch --all --tags --quiet
 
@@ -703,10 +732,8 @@ select_git_ref() {
     fi
 
     # Tags & Branches
-    trap '' ERR
     tags=("${(@f)$(git tag -l || true)}")
     branches=("${(@f)$(git branch -r | sed 's|origin/||' | grep -E '^[0-9]+\.[0-9]+\.x$' || true)}")
-    trap '[[ $? -ne 0 ]] && fail $? $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
     
     # Checkout
 if [[ "$ref" == "master" ]]; then
@@ -822,14 +849,32 @@ fi
 # Export compiler flags
 #######################################
 
-# Security: reject dangerous compiler flags that could execute arbitrary code
+# Security: allowlist-based compiler flag validation
+# Only permit flags matching known-safe patterns; reject everything else.
 for _flagvar in CFLAGS CXXFLAGS OBJCFLAGS OBJCXXFLAGS; do
-    if [[ "${(P)_flagvar}" == *-fplugin* ]] || \
-       [[ "${(P)_flagvar}" == *-include[[:space:]]/* ]] || \
-       [[ "${(P)_flagvar}" == *' -o '* ]] || \
-       [[ "${(P)_flagvar}" == *-x[[:space:]]assembler* ]]; then
-        fail 1 $LINENO "Dangerous flag detected in $_flagvar: ${(P)_flagvar}"
-    fi
+    for _flag in ${(z)${(P)_flagvar}}; do
+        case "$_flag" in
+            # Warnings, optimization, debug, defines, standards, arch
+            -W*|-O*|-g*|-D*|-std=*|-arch|-arch\ *|-m*|-pipe|-pthread) ;;
+            # Feature flags (safe subset)
+            -f[a-z]*)
+                case "$_flag" in
+                    -fplugin*) fail 1 $LINENO "Dangerous flag in $_flagvar: $_flag" ;;
+                    *) ;;
+                esac
+                ;;
+            # Include paths (but not -include with arbitrary files)
+            -I*|-isystem|-isysroot|-iframework) ;;
+            # Linker search paths
+            -L*|-l*|-framework|-F*) ;;
+            # Values that follow a flag (paths, names) — allow non-dash tokens
+            [!/+-@]*) ;;
+            # Explicitly dangerous: @file, -load, -B, -specs, -wrapper,
+            # -x assembler, -include, -o, -Xlinker, --sysroot
+            @*) fail 1 $LINENO "Response file not allowed in $_flagvar: $_flag" ;;
+            *)  fail 1 $LINENO "Disallowed flag in $_flagvar: $_flag" ;;
+        esac
+    done
 done
 
 [[ -n "$CFLAGS" ]] && export CFLAGS
@@ -848,7 +893,8 @@ install_deps() {
 
     check_command brew
     brew update
-    brew upgrade
+    # Security: only upgrade required dependencies, not all installed packages
+    brew upgrade "${BREW_DEPS[@]}"
     brew cleanup
     command -v rustup >/dev/null && rustup update || true
 }
@@ -954,15 +1000,21 @@ done < "$PATCH_STATE_FILE"
         continue
     fi
 
-   # Security: validate patch has no path traversal and copy to prevent TOCTOU
-    if grep -qE '^\+\+\+ [ab]/\.\.' "$patch" || grep -qE '^\-\-\- [ab]/\.\.' "$patch"; then
-        echo "⚠️  Patch contains path traversal sequences — skipping: $(basename "$patch")"
-        continue
-    fi
+   # Security: copy first, then validate the copy to eliminate TOCTOU
     local _safe_patch
     _safe_patch=$(mktemp "${TMPDIR:-/tmp}/hb-patch.XXXXXX")
     cp "$patch" "$_safe_patch"
     chmod 0600 "$_safe_patch"
+
+    # Check for path traversal: mid-path ../, leading ../, and absolute paths
+    if grep -qE '^\+\+\+ [ab]/.*\.\.' "$_safe_patch" || \
+       grep -qE '^\-\-\- [ab]/.*\.\.' "$_safe_patch" || \
+       grep -qE '^\+\+\+ /[^/]' "$_safe_patch" || \
+       grep -qE '^\-\-\- /[^/]' "$_safe_patch"; then
+        echo "⚠️  Patch contains path traversal or absolute path — skipping: $(basename "$patch")"
+        rm -f "$_safe_patch"
+        continue
+    fi
 
     if patch --dry-run --forward -p1 < "$_safe_patch" >/dev/null 2>&1; then
         echo "  → Applying $(basename "$patch")"
@@ -1025,7 +1077,11 @@ clean_build() {
     [[ "$BUILD_DIR" == "$ROOT"/build ]] || fail 1 $LINENO "Invalid build directory"
     # Security: validate DEV_DIR is a real absolute path, not a sensitive location
     local _real_dev_dir
-    _real_dev_dir=$(realpath "$DEV_DIR" 2>/dev/null || echo "$DEV_DIR")
+    _real_dev_dir=$(realpath "$DEV_DIR" 2>/dev/null) \
+        || fail 1 $LINENO "Cannot resolve DEV_DIR path: $DEV_DIR"
+    if [[ -L "$DEV_DIR" ]]; then
+        fail 1 $LINENO "DEV_DIR is a symlink (not allowed): $DEV_DIR"
+    fi
     case "$_real_dev_dir" in
         /|/System*|/usr*|/var*|/private*|/Applications|/Library)
             fail 1 $LINENO "DEV_DIR points to a protected system path: $_real_dev_dir"
@@ -1053,8 +1109,17 @@ echo "▶ ./configure options:"
 echo "   --launch-jobs=$JOBS --launch $ADD_CONFIG_OPTS"
 git diff --quiet || echo "⚠️  Building from modified sources"
 
+# Security: validate ADD_CONFIG_OPTS — reject path-altering or shell-unsafe options
 typeset -a CONFIG_OPTS
 CONFIG_OPTS=(${(z)${ADD_CONFIG_OPTS:-}})
+for _opt in "${CONFIG_OPTS[@]}"; do
+    case "$_opt" in
+        --prefix=*|--exec-prefix=*|--bindir=*|--sbindir=*|--libdir=*)
+            fail 1 $LINENO "Path-altering configure option not allowed: $_opt" ;;
+        *[';|&$\`']*)
+            fail 1 $LINENO "Shell metacharacter in configure option: $_opt" ;;
+    esac
+done
 
 ./configure \
     --launch-jobs="$JOBS" \
@@ -1142,14 +1207,19 @@ run_notarization() {
     local NOTARY_RC=$?
     set -e
 
+    # Security: clear password from memory as soon as possible
+    unset NOTARY_PASSWORD
+
     if (( NOTARY_RC != 0 )); then
         echo "❌  Notarization failed (exit code $NOTARY_RC)"
         echo
         echo "ℹ️  Last notarytool history (if available):"
 
+        # Security: suppress apple-id from terminal/log output
         xcrun notarytool history \
             --apple-id "$NOTARY_USERNAME" \
-            --team-id "$NOTARY_TEAMID" 2>/dev/null || true
+            --team-id "$NOTARY_TEAMID" 2>/dev/null \
+            | sed "s/$NOTARY_USERNAME/[REDACTED]/g" || true
 
         return "$NOTARY_RC"
     fi
@@ -1300,9 +1370,10 @@ functional_test() {
         return
     fi
 
-    # Security: use co-located hb-test instead of PATH lookup
-    local _hb_test
-    _hb_test="$(dirname "$0")/hb-test"
+    # Security: resolve real path of this script to prevent symlink hijack
+    local _hb_test _script_dir
+    _script_dir="$(dirname "$(realpath "$0")")"
+    _hb_test="$_script_dir/hb-test"
     if [[ ! -x "$_hb_test" ]]; then
         fail 1 $LINENO "Functional test script not found: $_hb_test"
     fi
