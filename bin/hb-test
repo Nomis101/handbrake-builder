@@ -1,5 +1,10 @@
 #!/usr/bin/env zsh
 set -euo pipefail
+IFS=$'\n\t'
+umask 077
+
+# Security: sanitize PATH to prevent execution of attacker-planted binaries
+PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 
 #######################################
 # Functional Test Input Assets
@@ -42,19 +47,19 @@ TEST_DIR="$ROOT/tests"
 INPUT="$TEST_DIR/inputs"
 OUTPUT="$TEST_DIR/outputs"
 
-# Security: verify paths are not symlinks before creating directories
+# Security: create directories then verify they are not symlinks (post-creation check)
 for _dir in "$TEST_DIR" "$INPUT" "$OUTPUT"; do
     if [[ -L "$_dir" ]]; then
         print "❌ Directory path is a symlink (possible attack): $_dir"
         exit 1
     fi
+    mkdir -p "$_dir"
+    chmod 0700 "$_dir"
+    if [[ -L "$_dir" ]]; then
+        print "❌ Directory became a symlink after creation (race detected): $_dir"
+        exit 1
+    fi
 done
-
-mkdir -p "$TEST_DIR"
-chmod 0700 "$TEST_DIR"
-mkdir -p "$INPUT"
-mkdir -p "$OUTPUT"
-chmod 0700 "$OUTPUT"
 
 #######################################
 # Framework and Helper
@@ -130,10 +135,14 @@ validate_env() {
         require "$t"
     done
 
-    mkdir -p "$OUTPUT"
-    # Security: verify OUTPUT is not a symlink before glob deletion
+    # Security: verify OUTPUT is not a symlink before AND after creation
     if [[ -L "$OUTPUT" ]]; then
         fail "Output directory is a symlink: $OUTPUT"
+        return 1
+    fi
+    mkdir -p "$OUTPUT"
+    if [[ -L "$OUTPUT" ]]; then
+        fail "Output directory became a symlink (race detected): $OUTPUT"
         return 1
     fi
     rm -f "$OUTPUT"/*(N)
@@ -871,8 +880,11 @@ print "======================================"
 
 if [[ $failed -eq 0 ]]; then
     print "✔ ALL TESTS PASSED"
+    # Security: clean up .stderr files on success to avoid information leakage
+    rm -f "$OUTPUT"/*.stderr(N)
 else
     print "❌ SOME TESTS FAILED"
+    print "ℹ️  Encoder stderr logs retained in $OUTPUT for diagnosis"
 fi
 
 return $failed
