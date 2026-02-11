@@ -17,6 +17,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 setopt EXTENDED_GLOB
+umask 077
 
 #######################################
 # Location for buildconfig.conf file
@@ -227,6 +228,15 @@ log_intro
 load_config() {
     # Does file exist
     if [[ -f "$CONFIG_FILE" ]]; then
+        # Security: verify config file ownership and permissions before sourcing
+        if [[ ! -O "$CONFIG_FILE" ]]; then
+            fail 1 $LINENO "Config file not owned by current user: $CONFIG_FILE"
+        fi
+        local _cfg_mode
+        _cfg_mode=$(stat -f '%Lp' "$CONFIG_FILE")
+        if (( 8#$_cfg_mode & 8#022 )); then
+            fail 1 $LINENO "Config file is group/world-writable (mode $_cfg_mode): $CONFIG_FILE"
+        fi
         echo "✔ Configuration file found – loading"
         source "$CONFIG_FILE"
     else
@@ -238,10 +248,11 @@ load_config() {
             Yes|yes|Y|y)
                 echo "Creating configuration file"
                 mkdir -p "$CONFIG_DIR"
+                chmod 0700 "$CONFIG_DIR"
                 
                 # Check DEV_DIR
                 if [[ -z "$DEV_DIR" ]]; then
-                    DEV_DIR="$HOME//Documents"
+                    DEV_DIR="$HOME/Documents"
                     echo "⚠️  DEV_DIR was empty – setting to $DEV_DIR"
                 fi
 
@@ -374,6 +385,12 @@ load_config
 # Enforce defaults (nounset safety)
 #######################################
 
+# Security: clear sensitive variables to prevent environment injection
+unset ADD_CONFIG_OPTS CFLAGS CXXFLAGS OBJCFLAGS OBJCXXFLAGS 2>/dev/null || true
+
+# Re-source config to set variables (already validated above)
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
 : "${DEV_DIR:=$HOME/Developer}"
 
 : "${HB_GIT_REF:=master}"
@@ -418,9 +435,19 @@ ERRORLOG="$LOGDIR/errors-$(date '+%Y%m%d-%H%M').log"
 # Create all needed subfolders
 #######################################
 
+# Security: verify paths are not symlinks before creating directories
+for _dir in "$CONFIG_DIR" "$LOGDIR" "$BACKUPDIR" "$PATCHDIR"; do
+    if [[ -L "$_dir" ]]; then
+        fail 1 $LINENO "Directory path is a symlink (possible attack): $_dir"
+    fi
+done
+
 mkdir -p "$LOGDIR"
+chmod 0700 "$LOGDIR"
 mkdir -p "$BACKUPDIR"
+chmod 0700 "$BACKUPDIR"
 mkdir -p "$PATCHDIR"
+chmod 0700 "$PATCHDIR"
 
 #######################################
 # Check for cargo-c
@@ -430,17 +457,23 @@ install_cargo_c() {
     # Check if Cargo is available
     if ! command -v cargo >/dev/null 2>&1; then
         echo "ℹ️ Rust / Cargo not found – installing via rustup"
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        local _rustup_installer
+        _rustup_installer=$(mktemp "${TMPDIR:-/tmp}/rustup-init.XXXXXX")
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$_rustup_installer"
+        echo "⚠️  Downloaded rustup installer — SHA-256: $(shasum -a 256 "$_rustup_installer" | awk '{print $1}')"
+        chmod +x "$_rustup_installer"
+        "$_rustup_installer" -y
+        rm -f "$_rustup_installer"
         export PATH="$HOME/.cargo/bin:$PATH"
     fi
 
     # Check if cargo-c is installed
     if command -v cargo-c >/dev/null 2>&1; then
         echo "✔ cargo-c already installed – updating..."
-        cargo install cargo-c --force
+        cargo install cargo-c --force --locked
     else
         echo "⬇️ Installing cargo-c via cargo"
-        cargo install cargo-c
+        cargo install cargo-c --locked
     fi
 }
 
@@ -450,8 +483,14 @@ install_cargo_c() {
 
 if ! has_command brew; then
     echo "🍺  Homebrew not found – starting installation"
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    eval "$(/opt/homebrew/bin/brew shellenv)"
+    local _brew_installer
+    _brew_installer=$(mktemp "${TMPDIR:-/tmp}/brew-install.XXXXXX")
+    curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$_brew_installer"
+    echo "⚠️  Downloaded Homebrew installer — SHA-256: $(shasum -a 256 "$_brew_installer" | awk '{print $1}')"
+    /bin/bash "$_brew_installer"
+    rm -f "$_brew_installer"
+    # Set up brew environment using explicit PATH instead of eval
+    export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
 else
     echo "✔ Homebrew is installed"
 fi
@@ -502,6 +541,8 @@ install_cargo_c
 if [[ ! -d "$ROOT/.git" ]]; then
     echo "📦  HandBrake repository not found – cloning into $DEV_DIR"
     cd "$DEV_DIR"
+    # Note: clone is over HTTPS (transport security only). For tagged releases,
+    # consider verifying GPG signatures with: git verify-tag "$ref"
     git clone https://github.com/HandBrake/HandBrake.git
 else
     echo "✔ HandBrake repository present"
@@ -513,7 +554,6 @@ fi
 
 log_header() {
     if [[ "$ENABLE_LOG" == "1" ]]; then
-        find "$LOGDIR" -type f -name 'build-*.log' -mtime +14 -exec rm -f {} \; || true
         find "$LOGDIR" -type f \( \
         -name 'build-*.log' \
         -o -name 'warnings-*.log' \
@@ -531,6 +571,7 @@ log_header() {
         files=("$LOGDIR"/errors-*.log(Nom))
         (( ${#files} > 49 )) && rm -f -- "${files[50,-1]}"
         exec > >(tee -a "$LOGFILE") 2>&1
+        chmod 0600 "$LOGFILE"
     fi
 }
 
@@ -604,7 +645,12 @@ select_git_ref() {
     local resolved_ref=""
     local auto_stash=""
 
-    # Temporarily disable 
+    # Security: validate git ref format (alphanumeric, dots, dashes, underscores, slashes)
+    if [[ "$ref" != "latest" ]] && [[ ! "$ref" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+        fail 1 $LINENO "Invalid characters in HB_GIT_REF: $ref"
+    fi
+
+    # Temporarily disable
     trap '' ERR
     echo "🔖 Selecting Git reference: $ref"
     trap '[[ $? -ne 0 ]] && fail $? $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
@@ -619,9 +665,9 @@ select_git_ref() {
     local will_switch=0
     if [[ "$ref" == "master" && "$current_ref" != "master" ]]; then
         will_switch=1
-    elif git tag -l | grep -qx "$ref" && [[ "$current_ref" != "$ref" ]]; then
+    elif git tag -l | grep -qxF "$ref" && [[ "$current_ref" != "$ref" ]]; then
         will_switch=1
-    elif git branch -r | sed 's|origin/||' | grep -E '^[0-9]+\.[0-9]+\.x$' | grep -qx "$ref" && [[ "$current_ref" != "$ref" ]]; then
+    elif git branch -r | sed 's|origin/||' | grep -E '^[0-9]+\.[0-9]+\.x$' | grep -qxF "$ref" && [[ "$current_ref" != "$ref" ]]; then
         will_switch=1
     fi
 
@@ -640,7 +686,7 @@ select_git_ref() {
         # Interactive question about stashing
         read "stash_answer?Do you want to automatically stash these changes before switching Git reference? [y/N]: "
         if [[ "$stash_answer" =~ ^[Yy]$ ]]; then
-            git stash push -u -m "Auto-stash before switching to $ref"
+            git stash push -u -m "Auto-stash before switching to ${ref//[^A-Za-z0-9._-]/}"
             echo "✔ Changes stashed"
         else
             echo "❌ Ref switch aborted to prevent data loss"
@@ -666,7 +712,7 @@ select_git_ref() {
 if [[ "$ref" == "master" ]]; then
     if is_detached_head; then
         echo "🔁 Returning from detached HEAD to master"
-        git checkout master --quiet
+        git checkout --quiet master
 
         auto_stash="$(find_latest_auto_stash || true)"
 
@@ -691,16 +737,16 @@ if [[ "$ref" == "master" ]]; then
 
     elif (( will_switch )); then
         echo "✔ Switching to master"
-        git checkout master --quiet
+        git checkout --quiet master
     else
         echo "✔ Staying on master – no ref change needed"
     fi
     elif (( ${tags[(Ie)$ref]} )); then
         echo "✔ Using release tag: $ref"
-        git checkout --detach "$ref" --quiet
+        git checkout --detach --quiet -- "$ref"
     elif (( ${branches[(Ie)$ref]} )); then
         echo "✔ Using release branch: $ref"
-        git checkout -B "$ref" "origin/$ref" --quiet
+        git checkout -B "$ref" "origin/$ref" --quiet --
     else
         echo
         echo "❌ Invalid Git reference: $ref"
@@ -776,6 +822,16 @@ fi
 # Export compiler flags
 #######################################
 
+# Security: reject dangerous compiler flags that could execute arbitrary code
+for _flagvar in CFLAGS CXXFLAGS OBJCFLAGS OBJCXXFLAGS; do
+    if [[ "${(P)_flagvar}" == *-fplugin* ]] || \
+       [[ "${(P)_flagvar}" == *-include[[:space:]]/* ]] || \
+       [[ "${(P)_flagvar}" == *' -o '* ]] || \
+       [[ "${(P)_flagvar}" == *-x[[:space:]]assembler* ]]; then
+        fail 1 $LINENO "Dangerous flag detected in $_flagvar: ${(P)_flagvar}"
+    fi
+done
+
 [[ -n "$CFLAGS" ]] && export CFLAGS
 [[ -n "$CXXFLAGS" ]] && export CXXFLAGS
 [[ -n "$OBJCFLAGS" ]] && export OBJCFLAGS
@@ -850,7 +906,7 @@ apply_patches() {
     record="${record//\"/}"
 
     # Strict validation
-    [[ "$record" == [A-Za-z0-9._-]##.patch:* ]] || {
+    [[ "$record" == [A-Za-z0-9._-]##.patch:[0-9a-f](#c64) ]] || {
         echo "⚠️  Ignoring invalid patch state entry: $record"
         continue
     }
@@ -871,7 +927,8 @@ done < "$PATCH_STATE_FILE"
             if [[ -t 0 ]]; then
                 read "ans?Remove stale state entry? [y/N]: "
                 if [[ "$ans" =~ ^[Yy]$ ]]; then
-                    sed -i '' "\|^$record\$|d" "$PATCH_STATE_FILE"
+                    grep -vxF "$record" "$PATCH_STATE_FILE" > "$PATCH_STATE_FILE.tmp" \
+                        && mv "$PATCH_STATE_FILE.tmp" "$PATCH_STATE_FILE"
                     unset "applied[$record]"
                     echo "✔ Removed stale patch state"
                 else
@@ -897,14 +954,25 @@ done < "$PATCH_STATE_FILE"
         continue
     fi
 
-   if patch --dry-run --forward -p1 < "$patch" >/dev/null 2>&1; then
+   # Security: validate patch has no path traversal and copy to prevent TOCTOU
+    if grep -qE '^\+\+\+ [ab]/\.\.' "$patch" || grep -qE '^\-\-\- [ab]/\.\.' "$patch"; then
+        echo "⚠️  Patch contains path traversal sequences — skipping: $(basename "$patch")"
+        continue
+    fi
+    local _safe_patch
+    _safe_patch=$(mktemp "${TMPDIR:-/tmp}/hb-patch.XXXXXX")
+    cp "$patch" "$_safe_patch"
+    chmod 0600 "$_safe_patch"
+
+    if patch --dry-run --forward -p1 < "$_safe_patch" >/dev/null 2>&1; then
         echo "  → Applying $(basename "$patch")"
-        if ! patch --forward --batch -p1 < "$patch"; then
+        if ! patch --forward --batch -p1 < "$_safe_patch"; then
             echo "⚠️  Patch partially failed or conflicts detected: $(basename "$patch")"
         fi
     else
         echo "✔ Patch already present in source: $(basename "$patch")"
     fi
+    rm -f "$_safe_patch"
 
     grep -qxF "$key" "$PATCH_STATE_FILE" || echo "$key" >> "$PATCH_STATE_FILE"
     applied["$key"]=1
@@ -955,6 +1023,15 @@ fi
 
 clean_build() {
     [[ "$BUILD_DIR" == "$ROOT"/build ]] || fail 1 $LINENO "Invalid build directory"
+    # Security: validate DEV_DIR is a real absolute path, not a sensitive location
+    local _real_dev_dir
+    _real_dev_dir=$(realpath "$DEV_DIR" 2>/dev/null || echo "$DEV_DIR")
+    case "$_real_dev_dir" in
+        /|/System*|/usr*|/var*|/private*|/Applications|/Library)
+            fail 1 $LINENO "DEV_DIR points to a protected system path: $_real_dev_dir"
+            ;;
+    esac
+    [[ -d "$BUILD_DIR" ]] || { echo "ℹ️  Build directory does not exist – nothing to clean"; return; }
     rm -rf "$BUILD_DIR"
     rm -f "$ROOT/hbsign.log"
     rm -rf "$ROOT/macosx/DerivedData"
@@ -1058,10 +1135,10 @@ run_notarization() {
     cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
 
     set +e
-    make notarize \
+    # Security: pass password via environment variable, not command-line argument
+    PASSWORD="$NOTARY_PASSWORD" make notarize \
         USERNAME="$NOTARY_USERNAME" \
-        TEAMID="$NOTARY_TEAMID" \
-        PASSWORD="$NOTARY_PASSWORD"
+        TEAMID="$NOTARY_TEAMID"
     local NOTARY_RC=$?
     set -e
 
@@ -1223,14 +1300,17 @@ functional_test() {
         return
     fi
 
-    if ! command -v hb-test >/dev/null 2>&1; then
-        fail 1 $LINENO "Functional test binary not found in PATH: hb-test"
+    # Security: use co-located hb-test instead of PATH lookup
+    local _hb_test
+    _hb_test="$(dirname "$0")/hb-test"
+    if [[ ! -x "$_hb_test" ]]; then
+        fail 1 $LINENO "Functional test script not found: $_hb_test"
     fi
 
     echo "----------------------------------------"
     echo "▶ Running functional tests"
 
-    if ! hb-test; then
+    if ! "$_hb_test"; then
         fail 1 $LINENO "Functional tests failed"
     fi
 
