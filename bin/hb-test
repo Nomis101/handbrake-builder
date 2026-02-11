@@ -42,9 +42,19 @@ TEST_DIR="$ROOT/tests"
 INPUT="$TEST_DIR/inputs"
 OUTPUT="$TEST_DIR/outputs"
 
+# Security: verify paths are not symlinks before creating directories
+for _dir in "$TEST_DIR" "$INPUT" "$OUTPUT"; do
+    if [[ -L "$_dir" ]]; then
+        print "❌ Directory path is a symlink (possible attack): $_dir"
+        exit 1
+    fi
+done
+
 mkdir -p "$TEST_DIR"
+chmod 0700 "$TEST_DIR"
 mkdir -p "$INPUT"
 mkdir -p "$OUTPUT"
+chmod 0700 "$OUTPUT"
 
 #######################################
 # Framework and Helper
@@ -73,6 +83,12 @@ skip() {
 
 require() {
     command -v "$1" >/dev/null 2>&1 || fail "Missing tool: $1"
+}
+
+# Security: capture encoder stderr to per-test log files instead of discarding
+run_encode() {
+    local _stderr_log="${out:r}.stderr"
+    HandBrakeCLI "$@" >/dev/null 2>"$_stderr_log"
 }
 
 assert_file() {
@@ -115,6 +131,11 @@ validate_env() {
     done
 
     mkdir -p "$OUTPUT"
+    # Security: verify OUTPUT is not a symlink before glob deletion
+    if [[ -L "$OUTPUT" ]]; then
+        fail "Output directory is a symlink: $OUTPUT"
+        return 1
+    fi
     rm -f "$OUTPUT"/*(N)
 }
 
@@ -148,10 +169,10 @@ test_h264_sdr() {
 
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e x264 --encoder-preset veryfast \
         --audio 1 --aencoder copy \
-        --subtitle none >/dev/null 2>&1; then
+        --subtitle none; then
         fail "FT-01: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -191,10 +212,10 @@ test_hevc_sdr() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e x265 --encoder-profile main \
         --audio 1 --aencoder copy \
-        --subtitle none >/dev/null 2>&1; then
+        --subtitle none; then
         fail "FT-02: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -229,9 +250,9 @@ test_hevc_hdr10() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
        -e x265 --encoder-profile main10 \
-       --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+       --audio 1 --aencoder copy --subtitle none; then
        fail "FT-03: encoder crashed or returned non-zero exit code"
        return 1
     fi
@@ -267,10 +288,10 @@ test_av1_sdr() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e svt_av1 --encoder-preset 8 \
         --audio 1 --aencoder copy \
-        --subtitle none >/dev/null 2>&1; then
+        --subtitle none; then
         fail "FT-04: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -304,10 +325,10 @@ test_av1_hdr10_4k() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e svt_av1_10bit --encoder-preset 10 \
         --audio 1 --aencoder copy \
-        --subtitle none >/dev/null 2>&1; then
+        --subtitle none; then
         fail "FT-05: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -345,9 +366,9 @@ test_audio_downmix() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         --audio 1 --aencoder aac --mixdown stereo \
-        --subtitle none >/dev/null 2>&1; then
+        --subtitle none; then
         fail "FT-06: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -381,9 +402,9 @@ test_subtitles() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         --subtitle 1 --subtitle-burned=none \
-        --audio 1 --aencoder copy >/dev/null 2>&1; then
+        --audio 1 --aencoder copy; then
         fail "FT-07: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -417,10 +438,10 @@ test_hevc_hdr10plus() {
 
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e x265_10bit --encoder-profile main10 --format mkv \
         --hdr-dynamic-metadata hdr10plus \
-        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        --audio 1 --aencoder copy --subtitle none; then
         fail "FT-08: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -463,10 +484,10 @@ test_dolby_vision() {
         return
     }
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e x265_10bit --encoder-profile main10 \
         --hdr-dynamic-metadata dolbyvision \
-        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        --audio 1 --aencoder copy --subtitle none; then
         fail "FT-09: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -508,9 +529,9 @@ test_mpeg2_sdr() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e mpeg2 --format mkv \
-        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        --audio 1 --aencoder copy --subtitle none; then
         fail "FT-10: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -544,9 +565,9 @@ test_mpeg4() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e mpeg4 --format mp4 \
-        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        --audio 1 --aencoder copy --subtitle none; then
         fail "FT-11: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -580,9 +601,9 @@ test_ffv1() {
 
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e ffv1 --format mkv --encoder-level 3 \
-        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        --audio 1 --aencoder copy --subtitle none; then
         fail "FT-12: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -615,9 +636,9 @@ test_h264_vt() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e vt_h264 --format mp4 \
-        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        --audio 1 --aencoder copy --subtitle none; then
         fail "FT-13: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -658,9 +679,9 @@ test_h265_vt() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e vt_h265 --format mp4 \
-        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        --audio 1 --aencoder copy --subtitle none; then
         fail "FT-14: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -701,9 +722,9 @@ test_h265_vt_10bit() {
     
     assert_file "$in"
 
-   if ! HandBrakeCLI -i "$in" -o "$out" \
+   if ! run_encode -i "$in" -o "$out" \
         -e vt_h265_10bit --format mp4 \
-        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        --audio 1 --aencoder copy --subtitle none; then
         fail "FT-15: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -743,9 +764,9 @@ test_vp9_mp4() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e vp9 --format mp4 \
-        --audio 1 --aencoder copy --subtitle none >/dev/null 2>&1; then
+        --audio 1 --aencoder copy --subtitle none; then
         fail "FT-16: encoder crashed or returned non-zero exit code"
         return 1
     fi
@@ -779,9 +800,9 @@ test_theora() {
     
     assert_file "$in"
 
-    if ! HandBrakeCLI -i "$in" -o "$out" \
+    if ! run_encode -i "$in" -o "$out" \
         -e theora --format mkv \
-        --audio none --subtitle none >/dev/null 2>&1; then
+        --audio none --subtitle none; then
         fail "FT-17: encoder crashed or returned non-zero exit code"
         return 1
     fi
