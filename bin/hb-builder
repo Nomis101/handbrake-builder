@@ -20,7 +20,20 @@ setopt EXTENDED_GLOB
 umask 077
 
 # Security: sanitize PATH to prevent execution of attacker-planted binaries
-PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# (includes the standard Homebrew prefixes and rustup's cargo bin so existing
+# installations are detected on both Intel and Apple Silicon)
+PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.cargo/bin"
+
+# Resolve this script's real location early – inside a zsh function $0 is the
+# function name (FUNCTION_ARGZERO), so it must be captured at top level
+SCRIPT_DIR="${0:A:h}"
+
+# Capture whether stdout is a terminal BEFORE log_header replaces it with the
+# tee pipe – "[[ -t 1 ]]" is always false after that redirect
+[[ -t 1 ]] && _STDOUT_TTY=1 || _STDOUT_TTY=0
+
+# terminal-notifier app bundle (verified with -x before every use)
+TERMINAL_NOTIFIER="/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier"
 
 #######################################
 # Location for buildconfig.conf file
@@ -68,6 +81,9 @@ validate_environment() {
             || fail 1 $LINENO "notarytool not available (Xcode 13+ required)"
     fi
 
+    # --- Development directory ---
+    mkdir -p "$DEV_DIR" || fail 1 $LINENO "Cannot create DEV_DIR: $DEV_DIR"
+
     # --- Disk space ---
     local avail_kb required_kb
     avail_kb=$(df -Pk "$DEV_DIR" | awk 'NR==2 {print $4}')
@@ -85,9 +101,12 @@ validate_environment() {
 #######################################
 
 collect_errors() {
-    if [[ "$ERROR_LOG" != "1" ]]; then
+    if [[ "${ERROR_LOG:-}" != "1" ]]; then
         return
     fi
+
+    # No build log yet (early failure or ENABLE_LOG=0) – nothing to collect
+    [[ -f "${LOGFILE:-}" ]] || return 0
 
     mkdir -p "$LOGDIR"
     : > "$ERRORLOG"
@@ -95,13 +114,15 @@ collect_errors() {
     sed -E 's/\x1B\[[0-9;]*[mK]//g' "$LOGFILE" 2>/dev/null \
     | awk '
     BEGIN {
-        IGNORECASE = 1
         err = 0
         done = 0
     }
 
+    # BSD awk has no IGNORECASE – match against a lowercased copy instead
+    { low = tolower($0) }
+
     # ---- primary error trigger ----
-    !done && /(^|[[:space:]])(fatal error:|error:|syntaxerror|internal inconsistency error|build interrupted)/ {
+    !done && low ~ /(^|[[:space:]])(fatal error:|error:|syntaxerror|internal inconsistency error|build interrupted)/ {
         err = 1
         done = 1
         sub(/^[[:space:]]*/, "  : ")
@@ -110,7 +131,7 @@ collect_errors() {
     }
 
     # ---- allowed continuation lines ----
-    err && /included from/ {
+    err && low ~ /included from/ {
         sub(/^[[:space:]]*/, "  : ")
         print
         next
@@ -125,7 +146,7 @@ collect_errors() {
         print
         next
     }
-    err && /^[[:space:]]*[0-9]+ error generated/ {
+    err && low ~ /^[[:space:]]*[0-9]+ error generated/ {
         sub(/^[[:space:]]*/, "  : ")
         print
         next
@@ -135,7 +156,7 @@ collect_errors() {
         print
         next
     }
-    err && /\*\* BUILD INTERRUPTED \*\*/ {
+    err && low ~ /\*\* build interrupted \*\*/ {
         sub(/^[[:space:]]*/, "  : ")
         print
         next
@@ -166,7 +187,7 @@ fail() {
     collect_errors
 
     command -v afplay >/dev/null && afplay /System/Library/Sounds/Funk.aiff || true
-    command -v terminal-notifier >/dev/null && /Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier \
+    [[ -x "$TERMINAL_NOTIFIER" ]] && "$TERMINAL_NOTIFIER" \
         -title "HandBrake" \
         -message "$(date '+%d-%m-%Y %H:%M'): Build failed (Exit $exit_code, Line $line)" || true
 
@@ -174,17 +195,32 @@ fail() {
     echo "   Exit code : $exit_code"
     echo "   Line      : $line"
     echo "   Command   : $cmd"
-    
-    if [[ -s "$ERRORLOG" ]]; then
+
+    if [[ -s "${ERRORLOG:-}" ]]; then
         echo "❌  Error log written:"
         echo "   → $ERRORLOG"
-        [[ -t 1 ]] && open -R "$ERRORLOG"
+        (( ${_STDOUT_TTY:-0} )) && open -R "$ERRORLOG"
     fi
 
     exit "$exit_code"
 }
 
-trap 'rc=$?; [[ $rc -ne 0 ]] && fail $rc $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
+# Guard: set to 1 around blocks that handle errors manually – the ERR trap
+# fires even while "set +e" is in effect, which would bypass those handlers
+_ERR_TRAP_OFF=0
+trap 'rc=$?; (( _ERR_TRAP_OFF )) || fail $rc $LINENO "${ZSH_DEBUG_CMD:-<no command>}"' ERR
+
+# Track mktemp files so they are removed even when fail() aborts a step
+# between mktemp and the step's own "rm -f" (ERR trap exits immediately)
+typeset -a _TMPFILES
+_cleanup_tmpfiles() {
+    local _f
+    for _f in "${_TMPFILES[@]}"; do
+        [[ -f "$_f" ]] && rm -f -- "$_f"
+    done
+    return 0
+}
+trap '_cleanup_tmpfiles' EXIT
 
 has_command() {
     command -v "$1" >/dev/null 2>&1
@@ -229,27 +265,17 @@ log_intro
 #######################################
 
 load_config() {
-    # Does file exist
-    if [[ -f "$CONFIG_FILE" ]]; then
-        # Security: verify config file ownership and permissions before sourcing
-        if [[ ! -O "$CONFIG_FILE" ]]; then
-            fail 1 $LINENO "Config file not owned by current user: $CONFIG_FILE"
-        fi
-        local _cfg_mode
-        _cfg_mode=$(stat -f '%Lp' "$CONFIG_FILE")
-        if (( 8#$_cfg_mode & 8#022 )); then
-            fail 1 $LINENO "Config file is group/world-writable (mode $_cfg_mode): $CONFIG_FILE"
-        fi
-        # Security: copy to temp file and source the copy to eliminate TOCTOU window
-        _VALIDATED_CONFIG=$(mktemp "${TMPDIR:-/tmp}/hb-config.XXXXXX")
-        cp "$CONFIG_FILE" "$_VALIDATED_CONFIG"
-        chmod 0600 "$_VALIDATED_CONFIG"
-        echo "✔ Configuration file found – loading"
-        source "$_VALIDATED_CONFIG"
-    else
+    # Offer to create a template on first run
+    if [[ ! -f "$CONFIG_FILE" ]]; then
         echo "ℹ️  No configuration file found:"
         echo "   $CONFIG_FILE"
-        read "answer?Create a configuration file from template? [Yes/No]: "
+
+        local answer=""
+        if [[ -t 0 ]]; then
+            read "answer?Create a configuration file from template? [Yes/No]: "
+        else
+            echo "ℹ️  Non-interactive mode – running with default values"
+        fi
 
         case "$answer" in
             Yes|yes|Y|y)
@@ -257,12 +283,6 @@ load_config() {
                 mkdir -p "$CONFIG_DIR"
                 chmod 0700 "$CONFIG_DIR"
                 
-                # Check DEV_DIR
-                if [[ -z "$DEV_DIR" ]]; then
-                    DEV_DIR="$HOME/Documents"
-                    echo "⚠️  DEV_DIR was empty – setting to $DEV_DIR"
-                fi
-
                 # Write template with restricted permissions
                 install -m 0600 /dev/null "$CONFIG_FILE"
                 cat <<'EOF' > "$CONFIG_FILE"
@@ -281,7 +301,7 @@ load_config() {
 # Examples:
 #   DEV_DIR="$HOME/Developer"
 #   DEV_DIR="/Volumes/Developer"
-DEV_DIR="$HOME/Documents"
+DEV_DIR="$HOME/Developer"
 
 # Git reference to build
 # Valid values:
@@ -292,7 +312,7 @@ HB_GIT_REF="master"
 
 # Log generation
 # Enable (1) or disable (0) collection of compiler log
-# into a lof file
+# into a log file
 ENABLE_LOG=1
 
 # Error log generation
@@ -371,19 +391,34 @@ EOF
                 ;;
             *)
                 echo "ℹ️  Running script with default values"
-                # Check DEV_DIR pand set to default if needed
-                if [[ -z "$DEV_DIR" ]]; then
-                    DEV_DIR="$HOME/Developer"
-                    echo "⚠️  DEV_DIR was empty – automatically set to $DEV_DIR"
-                fi
                 ;;
         esac
     fi
 
-    # After loading check if DEV_DIR is still empty
-    if [[ -z "$DEV_DIR" ]]; then
+    # Load the configuration file (including a template created above)
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # Security: verify config file ownership and permissions before sourcing
+        if [[ ! -O "$CONFIG_FILE" ]]; then
+            fail 1 $LINENO "Config file not owned by current user: $CONFIG_FILE"
+        fi
+        local _cfg_mode
+        _cfg_mode=$(stat -f '%Lp' "$CONFIG_FILE")
+        if (( 8#$_cfg_mode & 8#022 )); then
+            fail 1 $LINENO "Config file is group/world-writable (mode $_cfg_mode): $CONFIG_FILE"
+        fi
+        # Security: copy to temp file and source the copy to eliminate TOCTOU window
+        _VALIDATED_CONFIG=$(mktemp "${TMPDIR:-/tmp}/hb-config.XXXXXX")
+        _TMPFILES+=("$_VALIDATED_CONFIG")
+        cp "$CONFIG_FILE" "$_VALIDATED_CONFIG"
+        chmod 0600 "$_VALIDATED_CONFIG"
+        echo "✔ Configuration file found – loading"
+        source "$_VALIDATED_CONFIG"
+    fi
+
+    # After loading check if DEV_DIR is still empty or unset
+    if [[ -z "${DEV_DIR:-}" ]]; then
         DEV_DIR="$HOME/Developer"
-        echo "⚠️  DEV_DIR still empty after loading – automatically set to $DEV_DIR"
+        echo "⚠️  DEV_DIR empty after loading – automatically set to $DEV_DIR"
     fi
 }
 
@@ -469,6 +504,7 @@ install_cargo_c() {
         echo "ℹ️ Rust / Cargo not found – installing via rustup"
         local _rustup_installer
         _rustup_installer=$(mktemp "${TMPDIR:-/tmp}/rustup-init.XXXXXX")
+        _TMPFILES+=("$_rustup_installer")
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$_rustup_installer"
         local _rustup_hash
         _rustup_hash=$(shasum -a 256 "$_rustup_installer" | awk '{print $1}')
@@ -480,6 +516,11 @@ install_cargo_c() {
                 rm -f "$_rustup_installer"
                 fail 1 $LINENO "Rustup installation aborted by user"
             fi
+        else
+            # Security: never execute a freshly downloaded installer without
+            # confirmation (same policy as the Homebrew install below)
+            rm -f "$_rustup_installer"
+            fail 1 $LINENO "Rustup install requires interactive confirmation"
         fi
         chmod +x "$_rustup_installer"
         "$_rustup_installer" -y
@@ -489,8 +530,14 @@ install_cargo_c() {
 
     # Check if cargo-c is installed
     if command -v cargo-c >/dev/null 2>&1; then
-        echo "✔ cargo-c already installed – updating..."
-        cargo install cargo-c --force --locked
+        # "--force" always rebuilds cargo-c from source (several minutes),
+        # so only refresh it when dependency updates are requested
+        if [[ "$UPDATE_DEPS" == "1" ]]; then
+            echo "✔ cargo-c already installed – updating (UPDATE_DEPS=1)"
+            cargo install cargo-c --force --locked
+        else
+            echo "✔ cargo-c already installed"
+        fi
     else
         echo "⬇️ Installing cargo-c via cargo"
         cargo install cargo-c --locked
@@ -505,6 +552,7 @@ if ! has_command brew; then
     echo "🍺  Homebrew not found – starting installation"
     local _brew_installer
     _brew_installer=$(mktemp "${TMPDIR:-/tmp}/brew-install.XXXXXX")
+    _TMPFILES+=("$_brew_installer")
     curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$_brew_installer"
     local _brew_hash
     _brew_hash=$(shasum -a 256 "$_brew_installer" | awk '{print $1}')
@@ -595,15 +643,19 @@ log_header() {
         local files
 
         files=("$LOGDIR"/build-*.log(Nom))
-        (( ${#files} > 49 )) && rm -f -- "${files[50,-1]}"
+        (( ${#files} > 49 )) && rm -f -- "${(@)files[50,-1]}"
 
         files=("$LOGDIR"/warnings-*.log(Nom))
-        (( ${#files} > 49 )) && rm -f -- "${files[50,-1]}"
+        (( ${#files} > 49 )) && rm -f -- "${(@)files[50,-1]}"
 
         files=("$LOGDIR"/errors-*.log(Nom))
-        (( ${#files} > 49 )) && rm -f -- "${files[50,-1]}"
-        exec > >(tee -a "$LOGFILE") 2>&1
+        (( ${#files} > 49 )) && rm -f -- "${(@)files[50,-1]}"
+
+        # Pre-create the log file so it exists with the right permissions
+        # before the asynchronous tee process starts (avoids a chmod race)
+        : > "$LOGFILE"
         chmod 0600 "$LOGFILE"
+        exec > >(tee -a "$LOGFILE") 2>&1
     fi
 }
 
@@ -622,18 +674,18 @@ check_git_updates() {
         return
     }
 
+    if [[ "$AUTO_GIT_PULL" != "1" ]]; then
+        echo "ℹ️  AUTO_GIT_PULL disabled"
+        return
+    fi
+
     # Check which branch we are currently on
     local current_branch
     current_branch=$(git rev-parse --abbrev-ref HEAD)
 
     # Only run AUTO_GIT_PULL on master
     if [[ "$current_branch" != "master" ]]; then
-        echo "ℹ️ AUTO_GIT_PULL ignored: currently on '$current_branch' (not master)"
-        return
-    fi
-
-    if [[ "$AUTO_GIT_PULL" != "1" ]]; then
-        echo "ℹ️  AUTO_GIT_PULL disabled"
+        echo "ℹ️ AUTO_GIT_PULL skipped: currently on '$current_branch' (not master)"
         return
     fi
 
@@ -655,8 +707,6 @@ check_git_updates() {
     fi
 }
 
-check_git_updates
-
 #######################################
 # Git reference selection (branch/tag)
 #######################################
@@ -665,8 +715,9 @@ is_detached_head() {
 }
 
 find_latest_auto_stash() {
+    # "git stash push -m <msg>" entries list as: stash@{N}: On <branch>: <msg>
     git stash list |
-        grep -m1 '^stash@{[0-9]\+}: Auto-stash before switching to ' |
+        grep -m1 -E '^stash@[{][0-9]+[}]: On [^:]+: Auto-stash before switching to ' |
         sed 's/:.*//'
 }
 
@@ -676,6 +727,7 @@ select_git_ref() {
     local ref="$HB_GIT_REF"
     local resolved_ref=""
     local auto_stash=""
+    local stashed_this_run=0
 
     # Security: validate git ref format (alphanumeric, dots, dashes, underscores, slashes)
     if [[ "$ref" != "latest" ]] && [[ ! "$ref" =~ ^[A-Za-z0-9._/-]+$ ]]; then
@@ -686,6 +738,20 @@ select_git_ref() {
 
     git fetch --all --tags --quiet
 
+    # Tags & Branches (unquoted ${(f)...} so empty command output yields an
+    # empty array instead of a single empty element)
+    tags=(${(f)"$(git tag -l || true)"})
+    branches=(${(f)"$(git branch -r | sed -E 's|^[[:space:]]*origin/||' | grep -E '^[0-9]+\.[0-9]+\.x$' || true)"})
+
+    # Resolve "latest" BEFORE the switch detection below, so the local-change
+    # safety net operates on the real target ref
+    if [[ "$ref" == "latest" ]]; then
+        resolved_ref="$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+        [[ -n "$resolved_ref" ]] || fail 1 $LINENO "Unable to resolve 'latest' – no valid release tags found"
+        echo "✔ Resolved 'latest' to release tag: $resolved_ref"
+        ref="$resolved_ref"
+    fi
+
     # Determine current ref (branch or tag/detached HEAD)
     local current_ref
     current_ref=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || git describe --tags --exact-match HEAD 2>/dev/null || echo "DETACHED")
@@ -694,14 +760,15 @@ select_git_ref() {
     local will_switch=0
     if [[ "$ref" == "master" && "$current_ref" != "master" ]]; then
         will_switch=1
-    elif git tag -l | grep -qxF "$ref" && [[ "$current_ref" != "$ref" ]]; then
+    elif (( ${tags[(Ie)$ref]} )) && [[ "$current_ref" != "$ref" ]]; then
         will_switch=1
-    elif git branch -r | sed 's|origin/||' | grep -E '^[0-9]+\.[0-9]+\.x$' | grep -qxF "$ref" && [[ "$current_ref" != "$ref" ]]; then
+    elif (( ${branches[(Ie)$ref]} )) && [[ "$current_ref" != "$ref" ]]; then
         will_switch=1
     fi
 
-    # Only warn if a ref change is planned
-    if (( will_switch )) && ! is_detached_head && [[ -n "$(git status --porcelain)" ]]; then
+    # Only warn if a ref change is planned (a detached HEAD counts too –
+    # switching away from a tag must protect local changes as well)
+    if (( will_switch )) && [[ -n "$(git status --porcelain)" ]]; then
         echo "⚠️  Local changes detected in HandBrake repository!"
         echo "▶ Showing 'git diff' for review:"
         git --no-pager diff
@@ -713,9 +780,14 @@ select_git_ref() {
         echo "💾 Backup patch created: $patch_file"
 
         # Interactive question about stashing
+        if [[ ! -t 0 ]]; then
+            echo "❌ Non-interactive mode – ref switch aborted to prevent data loss"
+            return 1
+        fi
         read "stash_answer?Do you want to automatically stash these changes before switching Git reference? [y/N]: "
         if [[ "$stash_answer" =~ ^[Yy]$ ]]; then
             git stash push -u -m "Auto-stash before switching to ${ref//[^A-Za-z0-9._-]/}"
+            stashed_this_run=1
             echo "✔ Changes stashed"
         else
             echo "❌ Ref switch aborted to prevent data loss"
@@ -723,29 +795,23 @@ select_git_ref() {
         fi
     fi
 
-    # Resolve "latest"
-    if [[ "$ref" == "latest" ]]; then
-        resolved_ref="$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
-        [[ -n "$resolved_ref" ]] || fail 1 $LINENO "Unable to resolve 'latest' – no valid release tags found"
-        echo "✔ Resolved 'latest' to release tag: $resolved_ref"
-        ref="$resolved_ref"
-    fi
-
-    # Tags & Branches
-    tags=("${(@f)$(git tag -l || true)}")
-    branches=("${(@f)$(git branch -r | sed 's|origin/||' | grep -E '^[0-9]+\.[0-9]+\.x$' || true)}")
-    
     # Checkout
 if [[ "$ref" == "master" ]]; then
     if is_detached_head; then
         echo "🔁 Returning from detached HEAD to master"
         git checkout --quiet master
 
-        auto_stash="$(find_latest_auto_stash || true)"
+        # Do not offer to restore a stash that was just created above –
+        # only stashes from earlier runs are candidates for restoration
+        auto_stash=""
+        (( stashed_this_run )) || auto_stash="$(find_latest_auto_stash || true)"
 
         if [[ -n "$auto_stash" ]]; then
             echo "💾 Auto-stash detected: $auto_stash"
-            read "restore_answer?Restore previously stashed changes? [y/N]: "
+            local restore_answer=""
+            if [[ -t 0 ]]; then
+                read "restore_answer?Restore previously stashed changes? [y/N]: "
+            fi
 
             if [[ "$restore_answer" =~ ^[Yy]$ ]]; then
                 echo "▶ Applying stash"
@@ -770,7 +836,8 @@ if [[ "$ref" == "master" ]]; then
     fi
     elif (( ${tags[(Ie)$ref]} )); then
         echo "✔ Using release tag: $ref"
-        git checkout --detach --quiet -- "$ref"
+        # Note: the ref must come BEFORE "--" (anything after is a pathspec)
+        git checkout --detach --quiet "$ref" --
     elif (( ${branches[(Ie)$ref]} )); then
         echo "✔ Using release branch: $ref"
         git checkout -B "$ref" "origin/$ref" --quiet --
@@ -801,6 +868,7 @@ if [[ "$ref" == "master" ]]; then
 }
 
 select_git_ref
+check_git_updates
 log_build_metadata
 
 #######################################
@@ -854,6 +922,9 @@ fi
 for _flagvar in CFLAGS CXXFLAGS OBJCFLAGS OBJCXXFLAGS; do
     for _flag in ${(z)${(P)_flagvar}}; do
         case "$_flag" in
+            # Linker/assembler/preprocessor pass-through is as dangerous as
+            # -Xlinker and must be rejected before the -W* allowance below
+            -Wl,*|-Wa,*|-Wp,*) fail 1 $LINENO "Pass-through flag not allowed in $_flagvar: $_flag" ;;
             # Warnings, optimization, debug, defines, standards, arch
             -W*|-O*|-g*|-D*|-std=*|-arch|-arch\ *|-m*|-pipe|-pthread) ;;
             # Feature flags (safe subset)
@@ -869,6 +940,8 @@ for _flagvar in CFLAGS CXXFLAGS OBJCFLAGS OBJCXXFLAGS; do
             -L*|-l*|-framework|-F*) ;;
             # Values that follow a flag (paths, names) — allow non-dash tokens
             [!/+-@]*) ;;
+            # Absolute path arguments to allowlisted flags (e.g. -isysroot /path)
+            /*) ;;
             # Explicitly dangerous: @file, -load, -B, -specs, -wrapper,
             # -x assembler, -include, -o, -Xlinker, --sysroot
             @*) fail 1 $LINENO "Response file not allowed in $_flagvar: $_flag" ;;
@@ -923,7 +996,11 @@ apply_patches() {
         echo "ℹ️  Patch directory not found – skipping patches"
         return
     fi
-    
+
+    # Must be initialized before the patch loop below: it is read after the
+    # if/else even when no patches exist (nounset safety)
+    local changed=0
+
     # Collect patches
     local patches
     patches=("$PATCHDIR"/*.patch(N))
@@ -957,7 +1034,10 @@ apply_patches() {
         continue
     }
 
-    applied["$record"]=1
+    # Note: subscript must be UNQUOTED – zsh treats subscript text as if it
+    # were already double-quoted, so ["$record"] would embed literal quote
+    # characters into the key and break every ${applied[$key]} lookup
+    applied[$record]=1
 done < "$PATCH_STATE_FILE"
     
 # Detect deleted patches referenced in state
@@ -973,9 +1053,16 @@ done < "$PATCH_STATE_FILE"
             if [[ -t 0 ]]; then
                 read "ans?Remove stale state entry? [y/N]: "
                 if [[ "$ans" =~ ^[Yy]$ ]]; then
-                    grep -vxF "$record" "$PATCH_STATE_FILE" > "$PATCH_STATE_FILE.tmp" \
-                        && mv "$PATCH_STATE_FILE.tmp" "$PATCH_STATE_FILE"
                     unset "applied[$record]"
+                    # Rewrite the state file from the validated in-memory
+                    # entries – a raw grep would miss lines that only became
+                    # valid after quote/whitespace cleanup above
+                    if (( ${#applied[@]} )); then
+                        print -l -- "${(@k)applied}" > "$PATCH_STATE_FILE.tmp"
+                    else
+                        : > "$PATCH_STATE_FILE.tmp"
+                    fi
+                    mv "$PATCH_STATE_FILE.tmp" "$PATCH_STATE_FILE"
                     echo "✔ Removed stale patch state"
                 else
                     fail 1 $LINENO "Stale patch state detected"
@@ -987,7 +1074,7 @@ done < "$PATCH_STATE_FILE"
     done
 
     # Apply patches
-    local patch checksum key changed=0
+    local patch checksum key
 
     cd "$ROOT" || fail 1 $LINENO "Directory $ROOT not found"
 
@@ -1003,14 +1090,15 @@ done < "$PATCH_STATE_FILE"
    # Security: copy first, then validate the copy to eliminate TOCTOU
     local _safe_patch
     _safe_patch=$(mktemp "${TMPDIR:-/tmp}/hb-patch.XXXXXX")
+    _TMPFILES+=("$_safe_patch")
     cp "$patch" "$_safe_patch"
     chmod 0600 "$_safe_patch"
 
-    # Check for path traversal: mid-path ../, leading ../, and absolute paths
-    if grep -qE '^\+\+\+ [ab]/.*\.\.' "$_safe_patch" || \
-       grep -qE '^\-\-\- [ab]/.*\.\.' "$_safe_patch" || \
-       grep -qE '^\+\+\+ /[^/]' "$_safe_patch" || \
-       grep -qE '^\-\-\- /[^/]' "$_safe_patch"; then
+    # Check for path traversal (a ".." path component anywhere, with or
+    # without a/ b/ prefixes) and absolute paths in +++/--- headers.
+    # "/dev/null" is the legitimate header for file creation/deletion.
+    if grep -qE '^(\+\+\+|\-\-\-) [^[:space:]]*\.\.(/|[[:space:]]|$)' "$_safe_patch" || \
+       grep -E '^(\+\+\+|\-\-\-) /' "$_safe_patch" | grep -vE '^(\+\+\+|\-\-\-) /dev/null([[:space:]]|$)' | grep -q .; then
         echo "⚠️  Patch contains path traversal or absolute path — skipping: $(basename "$patch")"
         rm -f "$_safe_patch"
         continue
@@ -1018,21 +1106,26 @@ done < "$PATCH_STATE_FILE"
 
     if patch --dry-run --forward -p1 < "$_safe_patch" >/dev/null 2>&1; then
         echo "  → Applying $(basename "$patch")"
-        if ! patch --forward --batch -p1 < "$_safe_patch"; then
+        if patch --forward --batch -p1 < "$_safe_patch"; then
+            changed=1
+        else
             echo "⚠️  Patch partially failed or conflicts detected: $(basename "$patch")"
+            rm -f "$_safe_patch"
+            continue   # do not record failed patches as applied
         fi
-    else
+    elif patch --dry-run --reverse --force -p1 < "$_safe_patch" >/dev/null 2>&1; then
+        # Applies cleanly in reverse → the patch is already in the source
         echo "✔ Patch already present in source: $(basename "$patch")"
+    else
+        echo "⚠️  Patch does not apply cleanly – skipping: $(basename "$patch")"
+        rm -f "$_safe_patch"
+        continue   # do not record; it will be retried on the next run
     fi
     rm -f "$_safe_patch"
 
     grep -qxF "$key" "$PATCH_STATE_FILE" || echo "$key" >> "$PATCH_STATE_FILE"
-    applied["$key"]=1
+    applied[$key]=1
 done
-fi
-
-if [[ ! -w "$PATCHDIR" ]]; then
-    echo "⚠️  Patch directory not writable – cannot create patches"
 fi
 
     # Detect unpatched local modifications
@@ -1075,10 +1168,12 @@ fi
 
 clean_build() {
     [[ "$BUILD_DIR" == "$ROOT"/build ]] || fail 1 $LINENO "Invalid build directory"
-    # Security: validate DEV_DIR is a real absolute path, not a sensitive location
+    # Security: validate DEV_DIR is a real absolute path, not a sensitive
+    # location. zsh's ":A" modifier resolves symlinks like realpath(3) –
+    # the realpath(1) binary does not exist before macOS 13.
     local _real_dev_dir
-    _real_dev_dir=$(realpath "$DEV_DIR" 2>/dev/null) \
-        || fail 1 $LINENO "Cannot resolve DEV_DIR path: $DEV_DIR"
+    _real_dev_dir="${DEV_DIR:A}"
+    [[ -n "$_real_dev_dir" ]] || fail 1 $LINENO "Cannot resolve DEV_DIR path: $DEV_DIR"
     if [[ -L "$DEV_DIR" ]]; then
         fail 1 $LINENO "DEV_DIR is a symlink (not allowed): $DEV_DIR"
     fi
@@ -1131,17 +1226,23 @@ build_handbrake() {
     cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
     echo "▶ Running make build"
 
+    # Output already reaches $LOGFILE through the global tee set up in
+    # log_header (a second tee here would duplicate every log line)
+    _ERR_TRAP_OFF=1
     set +e
-    make build 2>&1 | tee -a "$LOGFILE"
-    local rc=${pipestatus[1]}
+    make build 2>&1
+    local rc=$?
     set -e
+    _ERR_TRAP_OFF=0
 
     if (( rc != 0 )); then
         echo
         echo "❌ Build failed during compilation"
-        echo "🔍 Last compiler errors:"
 
-        grep -E "error:|fatal error:" "$LOGFILE" | tail -n 20 | sed 's/^/   /'
+        if [[ -s "${LOGFILE:-}" ]]; then
+            echo "🔍 Last compiler errors:"
+            grep -E "error:|fatal error:" "$LOGFILE" | tail -n 20 | sed 's/^/   /' || true
+        fi
 
         fail "$rc" $LINENO "make build failed"
     fi
@@ -1192,13 +1293,16 @@ run_notarization() {
         return
     fi
 
-    NOTARY_PASSWORD="$(get_notary_password)"
+    # "|| true" keeps a missing keychain item from killing the script via the
+    # ERR trap before the explicit, actionable check below is reached
+    NOTARY_PASSWORD="$(get_notary_password)" || true
 
     [[ -n "$NOTARY_PASSWORD" ]] || fail 1 $LINENO "Notary password not found in keychain"
 
     echo "🔐  Starting notarization"
     cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
 
+    _ERR_TRAP_OFF=1
     set +e
     # Security: pass password via environment variable, not command-line argument
     PASSWORD="$NOTARY_PASSWORD" make notarize \
@@ -1206,6 +1310,7 @@ run_notarization() {
         TEAMID="$NOTARY_TEAMID"
     local NOTARY_RC=$?
     set -e
+    _ERR_TRAP_OFF=0
 
     # Security: clear password from memory as soon as possible
     unset NOTARY_PASSWORD
@@ -1273,15 +1378,6 @@ optional_checks() {
 optional_checks
 
 #######################################
-# Success
-#######################################
-
-command -v afplay >/dev/null && afplay /System/Applications/Music.app/Contents/Resources/complete.aif || true
-command -v terminal-notifier >/dev/null && /Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier \
-    -title "HandBrake" \
-    -message "$(date '+%d-%m-%Y %H:%M'): Build successful"
-    
-#######################################
 # Package creation (optional)
 #######################################
 
@@ -1295,22 +1391,36 @@ create_pkg() {
 
     cd "$BUILD_DIR" || fail 1 $LINENO "Build directory not found"
 
+    _ERR_TRAP_OFF=1
     set +e
     make pkg.create
     local PKG_RC=$?
     set -e
+    _ERR_TRAP_OFF=0
 
     (( PKG_RC == 0 )) || fail "$PKG_RC" $LINENO "Package creation failed"
 
+    # (N) null-glob qualifiers: an unmatched bare glob is a hard zsh error
+    # that would abort the whole script after a successful build
+    local _artifacts _checksum_files
+    _artifacts=(pkg/*.dmg(N) pkg/*.tar.bz2(N) pkg/*.xml(N))
+    _checksum_files=(pkg/*.dmg(N) pkg/*.tar.bz2(N))
+
+    if (( ${#_artifacts[@]} == 0 )); then
+        fail 1 $LINENO "make pkg.create succeeded but produced no artifacts in pkg/"
+    fi
+
     echo "✔ Release artifacts created:"
-    ls -lh pkg/*.dmg pkg/*.tar.bz2 pkg/*.xml 2>/dev/null | sed 's/^/   /'
+    ls -lh -- "${(@)_artifacts}" | sed 's/^/   /'
 
     echo "✔ Package created"
-    echo "🔑  SHA-256 checksums:"
-    (
-        cd pkg || exit 1
-        shasum -a 256 *.dmg *.tar.bz2 2>/dev/null
-    )
+    if (( ${#_checksum_files[@]} )); then
+        echo "🔑  SHA-256 checksums:"
+        (
+            cd pkg || exit 1
+            shasum -a 256 -- "${(@)_checksum_files#pkg/}"
+        )
+    fi
 }
 
 #######################################
@@ -1322,6 +1432,11 @@ collect_warnings() {
         return
     fi
 
+    if [[ ! -f "${LOGFILE:-}" ]]; then
+        echo "ℹ️  No build log available (WARN_LOG requires ENABLE_LOG=1) – skipping warning collection"
+        return
+    fi
+
     echo "▶ Collecting compiler warnings"
 
     : > "$WARNLOG"
@@ -1329,18 +1444,20 @@ collect_warnings() {
     sed -E 's/\x1B\[[0-9;]*[mK]//g' "$LOGFILE" \
     | awk '
     BEGIN {
-    IGNORECASE = 1
     warn = 0
 }
 
-/(^|[[:space:]])warning:/ {
+# BSD awk has no IGNORECASE – match against a lowercased copy instead
+{ low = tolower($0) }
+
+low ~ /(^|[[:space:]])warning:/ {
     warn = 1
     sub(/^[[:space:]]*/, "  : ")
     print
     next
 }
 
-warn && /(^|[[:space:]])note:/ {
+warn && low ~ /(^|[[:space:]])note:/ {
     sub(/^[[:space:]]*/, "  : ")
     print
     next
@@ -1370,12 +1487,31 @@ functional_test() {
         return
     fi
 
-    # Security: resolve real path of this script to prevent symlink hijack
-    local _hb_test _script_dir
-    _script_dir="$(dirname "$(realpath "$0")")"
-    _hb_test="$_script_dir/hb-test"
+    # Security: SCRIPT_DIR was resolved via ${0:A:h} at top level (symlink-safe);
+    # $0 inside a function would be the function name, not the script path
+    local _hb_test="$SCRIPT_DIR/hb-test"
     if [[ ! -x "$_hb_test" ]]; then
         fail 1 $LINENO "Functional test script not found: $_hb_test"
+    fi
+
+    # The test harness tools are not installed by the build itself
+    local _tool
+    for _tool in ffprobe jq mediainfo; do
+        command -v "$_tool" >/dev/null 2>&1 \
+            || fail 1 $LINENO "Functional tests require '$_tool' (install via: brew install ffmpeg jq mediainfo)"
+    done
+
+    # Prefer the freshly built HandBrakeCLI over whatever happens to be on PATH
+    local _cli
+    for _cli in "$BUILD_DIR/HandBrakeCLI" "$BUILD_DIR/xroot/HandBrakeCLI"; do
+        if [[ -x "$_cli" ]]; then
+            export HB_CLI="$_cli"
+            echo "ℹ️  Testing freshly built CLI: $_cli"
+            break
+        fi
+    done
+    if [[ -z "${HB_CLI:-}" ]]; then
+        echo "⚠️  Freshly built HandBrakeCLI not found – testing HandBrakeCLI from PATH"
     fi
 
     echo "----------------------------------------"
@@ -1391,4 +1527,14 @@ functional_test() {
 collect_warnings
 create_pkg
 functional_test
+
+#######################################
+# Success
+#######################################
+
+command -v afplay >/dev/null && afplay /System/Applications/Music.app/Contents/Resources/complete.aif || true
+[[ -x "$TERMINAL_NOTIFIER" ]] && "$TERMINAL_NOTIFIER" \
+    -title "HandBrake" \
+    -message "$(date '+%d-%m-%Y %H:%M'): Build successful" || true
+
 exit 0

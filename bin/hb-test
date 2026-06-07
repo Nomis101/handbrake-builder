@@ -6,6 +6,10 @@ umask 077
 # Security: sanitize PATH to prevent execution of attacker-planted binaries
 PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 
+# HandBrakeCLI binary under test – hb-builder passes the freshly built CLI
+# via HB_CLI; standalone runs fall back to HandBrakeCLI on PATH
+HB_CLI="${HB_CLI:-HandBrakeCLI}"
+
 #######################################
 # Functional Test Input Assets
 #
@@ -68,20 +72,27 @@ done
 current_test=""
 
 fail() {
-    TEST_RESULTS[$current_test]="FAIL"
-    TEST_MESSAGES[$current_test]="$1"
+    # May be called outside run_test (e.g. validate_inputs) – guard empty key
+    if [[ -n "$current_test" ]]; then
+        TEST_RESULTS[$current_test]="FAIL"
+        TEST_MESSAGES[$current_test]="$1"
+    fi
     print "❌ FAIL: $1"
     return 1
 }
 
 pass() {
-    TEST_RESULTS[$current_test]="PASS"
+    if [[ -n "$current_test" ]]; then
+        TEST_RESULTS[$current_test]="PASS"
+    fi
     return 0
 }
 
 skip() {
-    TEST_RESULTS[$current_test]="SKIP"
-    TEST_MESSAGES[$current_test]="$1"
+    if [[ -n "$current_test" ]]; then
+        TEST_RESULTS[$current_test]="SKIP"
+        TEST_MESSAGES[$current_test]="$1"
+    fi
     print "⚠ SKIP: $1"
     return 0
 }
@@ -92,8 +103,19 @@ require() {
 
 # Security: capture encoder stderr to per-test log files instead of discarding
 run_encode() {
-    local _stderr_log="${out:r}.stderr"
-    HandBrakeCLI "$@" >/dev/null 2>"$_stderr_log"
+    # Derive the stderr log path from the -o argument instead of relying on
+    # the caller's local $out variable (dynamic scoping is fragile)
+    local _args=("$@") _out="" _idx
+    _idx=${_args[(Ie)-o]}
+    if (( _idx > 0 && _idx < ${#_args[@]} )); then
+        _out="${_args[_idx+1]}"
+    fi
+
+    if [[ -n "$_out" ]]; then
+        "$HB_CLI" "$@" >/dev/null 2>"${_out:r}.stderr"
+    else
+        "$HB_CLI" "$@" >/dev/null 2>&1
+    fi
 }
 
 assert_file() {
@@ -110,12 +132,20 @@ run_test() {
 
     print "▶ $test_id"
 
-   if "$@"; then
-        # Prüfe nochmal, ob die TEST_RESULTS von der Funktion gesetzt wurde
-        [[ -z "${TEST_RESULTS[$test_id]}" ]] && TEST_RESULTS[$test_id]="PASS"
+    # Record a default result if the test function did not set one itself.
+    # Note: ${...:-} guards nounset; the explicit return 0 keeps a failing
+    # test from aborting the whole suite via errexit.
+    if "$@"; then
+        if [[ -z "${TEST_RESULTS[$test_id]:-}" ]]; then
+            TEST_RESULTS[$test_id]="PASS"
+        fi
     else
-        [[ -z "${TEST_RESULTS[$test_id]}" ]] && TEST_RESULTS[$test_id]="FAIL"
+        if [[ -z "${TEST_RESULTS[$test_id]:-}" ]]; then
+            TEST_RESULTS[$test_id]="FAIL"
+        fi
     fi
+
+    return 0
 }
 
 #######################################
@@ -131,7 +161,7 @@ typeset -a TEST_ORDER
 #######################################
 
 validate_env() {
-    for t in HandBrakeCLI ffprobe jq mediainfo; do
+    for t in "$HB_CLI" ffprobe jq mediainfo; do
         require "$t"
     done
 
@@ -176,7 +206,7 @@ test_h264_sdr() {
     local out="$OUTPUT/ft01_h264_sdr.mkv"
     local probe
 
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e x264 --encoder-preset veryfast \
@@ -186,12 +216,7 @@ test_h264_sdr() {
         return 1
     fi
 
-    assert_file "$out"
-
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
     
     probe=$(ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name,pix_fmt,color_transfer \
@@ -219,7 +244,7 @@ test_hevc_sdr() {
     local in="$INPUT/sdr_1080p.mp4"
     local out="$OUTPUT/ft02_hevc_sdr.mkv"
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e x265 --encoder-profile main \
@@ -229,12 +254,7 @@ test_hevc_sdr() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name,pix_fmt \
@@ -255,9 +275,9 @@ test_hevc_sdr() {
 
 test_hevc_hdr10() {
     local in="$INPUT/hevc_hdr10.mkv"
-    local out="$OUTPUT/ft03_ahevc_hdr10.mkv"
+    local out="$OUTPUT/ft03_hevc_hdr10.mkv"
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
        -e x265 --encoder-profile main10 \
@@ -266,12 +286,7 @@ test_hevc_hdr10() {
        return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams v:0 \
         -show_entries stream=pix_fmt,color_primaries,color_transfer \
@@ -295,7 +310,7 @@ test_av1_sdr() {
     local in="$INPUT/sdr_1080p.mp4"
     local out="$OUTPUT/ft04_av1_sdr.mkv"
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e svt_av1 --encoder-preset 8 \
@@ -305,12 +320,7 @@ test_av1_sdr() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name,pix_fmt \
@@ -332,7 +342,7 @@ test_av1_hdr10_4k() {
     local in="$INPUT/hevc_hdr10.mkv"
     local out="$OUTPUT/ft05_av1_hdr10_4k.mkv"
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e svt_av1_10bit --encoder-preset 10 \
@@ -342,12 +352,7 @@ test_av1_hdr10_4k() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name,pix_fmt,color_primaries,color_transfer,width,height \
@@ -373,7 +378,7 @@ test_audio_downmix() {
     local in="$INPUT/audio_5.1.mkv"
     local out="$OUTPUT/ft06_audio_downmix.mkv"
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         --audio 1 --aencoder aac --mixdown stereo \
@@ -382,12 +387,7 @@ test_audio_downmix() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams a:0 \
         -show_entries stream=channels \
@@ -409,7 +409,7 @@ test_subtitles() {
     local in="$INPUT/ft07_subs.mkv"
     local out="$OUTPUT/ft07_subs_out.mkv"
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         --subtitle 1 --subtitle-burned=none \
@@ -418,12 +418,7 @@ test_subtitles() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams s \
         -show_entries stream=index \
@@ -445,7 +440,7 @@ test_hevc_hdr10plus() {
     local in="$INPUT/hdr10plus_4k.mp4"
     local out="$OUTPUT/ft08_hevc_hdr10plus.mkv"
 
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e x265_10bit --encoder-profile main10 --format mkv \
@@ -455,12 +450,7 @@ test_hevc_hdr10plus() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     local hdr
     hdr=$(mediainfo --Output=JSON "$out" | jq -r '
@@ -486,7 +476,7 @@ test_dolby_vision() {
     local in="$INPUT/dolby_vision_1080p.mkv"
     local out="$OUTPUT/ft09_dolby_vision.mkv"
 
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     mediainfo "$in" | grep -qi "dolby vision" || {
         skip "Input has no Dolby Vision metadata"
@@ -501,22 +491,17 @@ test_dolby_vision() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     local dv
+    # Note: each "//" alternative must be parenthesized – jq's "+" binds
+    # tighter than "//", and null + string raises a runtime error
     dv=$(mediainfo --Output=JSON "$out" | jq -r '
         .media.track[]
         | select(."@type"=="Video")
-        | (
-            .HDR_Format // "" + " " +
-            .HDR_Format_Profile // "" + " " +
-            .HDR_Format_Compatibility // ""
-        )
+        | (.HDR_Format // "") + " " +
+          (.HDR_Format_Profile // "") + " " +
+          (.HDR_Format_Compatibility // "")
     ')
 
     if [[ "$dv" != *"dv"* ]] && [[ "$dv" != *"Dolby Vision"* ]]; then
@@ -536,7 +521,7 @@ test_mpeg2_sdr() {
     local in="$INPUT/sdr_1080p.mp4"
     local out="$OUTPUT/ft10_mpeg2_sdr.mkv"
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e mpeg2 --format mkv \
@@ -545,12 +530,7 @@ test_mpeg2_sdr() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name \
@@ -572,7 +552,7 @@ test_mpeg4() {
     local in="$INPUT/sdr_1080p.mp4"
     local out="$OUTPUT/ft11_mpeg4.mp4"
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e mpeg4 --format mp4 \
@@ -581,12 +561,7 @@ test_mpeg4() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name \
@@ -608,7 +583,7 @@ test_ffv1() {
     local in="$INPUT/sdr_1080p.mp4"
     local out="$OUTPUT/ft12_ffv1.mkv"
 
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e ffv1 --format mkv --encoder-level 3 \
@@ -617,12 +592,7 @@ test_ffv1() {
         return 1
     fi
     
-    assert_file "$out"
-
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "FT-12: Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name \
@@ -643,7 +613,7 @@ test_h264_vt() {
     local out="$OUTPUT/ft13_h264_vt.mp4"
     local probe
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e vt_h264 --format mp4 \
@@ -652,12 +622,7 @@ test_h264_vt() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
     
     probe=$(ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name,pix_fmt,color_transfer \
@@ -686,7 +651,7 @@ test_h265_vt() {
     local out="$OUTPUT/ft14_h265_vt.mp4"
     local probe
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e vt_h265 --format mp4 \
@@ -695,12 +660,7 @@ test_h265_vt() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
     
     probe=$(ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name,pix_fmt,color_transfer \
@@ -729,7 +689,7 @@ test_h265_vt_10bit() {
     local out="$OUTPUT/ft15_h265_vt_10bit.mp4"
     local probe
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
    if ! run_encode -i "$in" -o "$out" \
         -e vt_h265_10bit --format mp4 \
@@ -738,12 +698,7 @@ test_h265_vt_10bit() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
     
     probe=$(ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name,pix_fmt,color_transfer \
@@ -756,7 +711,7 @@ test_h265_vt_10bit() {
     ' >/dev/null; then
         echo "Actual stream metadata:"
         echo "$probe" | jq '.streams[0]'
-        fail "FT-15: Invalid H.265 SDR stream"
+        fail "FT-15: Invalid H.265 10-bit (HDR) stream"
         return 1
     fi
   
@@ -771,7 +726,7 @@ test_vp9_mp4() {
     local in="$INPUT/sdr_1080p.mp4"
     local out="$OUTPUT/ft16_vp9.mp4"
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e vp9 --format mp4 \
@@ -780,12 +735,7 @@ test_vp9_mp4() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name \
@@ -807,7 +757,7 @@ test_theora() {
     local in="$INPUT/sdr_1080p.mp4" 
     local out="$OUTPUT/ft17_theora.mkv"
     
-    assert_file "$in"
+    assert_file "$in" || return 1
 
     if ! run_encode -i "$in" -o "$out" \
         -e theora --format mkv \
@@ -816,12 +766,7 @@ test_theora() {
         return 1
     fi
 
-    assert_file "$out"
-    
-    if [[ ! -f "$out" || ! -s "$out" ]]; then
-        fail "Output file not created"
-        return 1
-    fi
+    assert_file "$out" || return 1
 
     if ! ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name \
@@ -829,6 +774,238 @@ test_theora() {
             .streams[0].codec_name=="theora"
         ' >/dev/null; then
         fail "FT-17: Theora encode failed"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-18: 4K → 1080p downscale (HDR preserved)
+#######################################
+
+test_downscale_hdr() {
+    local in="$INPUT/hevc_hdr10.mkv"
+    local out="$OUTPUT/ft18_downscale_1080p.mkv"
+    local probe
+
+    assert_file "$in" || return 1
+
+    if ! run_encode -i "$in" -o "$out" \
+        -e x265_10bit --encoder-profile main10 \
+        --width 1920 --height 1080 --crop 0:0:0:0 \
+        --audio 1 --aencoder copy --subtitle none; then
+        fail "FT-18: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out" || return 1
+
+    probe=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=width,height,pix_fmt,color_primaries,color_transfer \
+        -of json "$out")
+
+    if ! echo "$probe" | jq -e '
+        .streams[0].width==1920 and
+        .streams[0].height==1080 and
+        .streams[0].pix_fmt=="yuv420p10le" and
+        .streams[0].color_primaries=="bt2020" and
+        .streams[0].color_transfer=="smpte2084"
+    ' >/dev/null; then
+        echo "Actual stream metadata:"
+        echo "$probe" | jq '.streams[0]'
+        fail "FT-18: Downscale wrong geometry or HDR metadata lost"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-19: HDR → SDR tone mapping
+#######################################
+
+test_tonemap_sdr() {
+    local in="$INPUT/hevc_hdr10.mkv"
+    local out="$OUTPUT/ft19_tonemap_sdr.mkv"
+    local probe
+
+    assert_file "$in" || return 1
+
+    if ! run_encode -i "$in" -o "$out" \
+        -e x264 --colorspace bt709 \
+        --audio 1 --aencoder copy --subtitle none; then
+        fail "FT-19: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out" || return 1
+
+    probe=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=pix_fmt,color_primaries,color_transfer \
+        -of json "$out")
+
+    if ! echo "$probe" | jq -e '
+        .streams[0].pix_fmt=="yuv420p" and
+        .streams[0].color_primaries=="bt709" and
+        .streams[0].color_transfer=="bt709"
+    ' >/dev/null; then
+        echo "Actual stream metadata:"
+        echo "$probe" | jq '.streams[0]'
+        fail "FT-19: HDR input not tone-mapped to BT.709 SDR"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-20: Clip extraction (--start-at/--stop-at)
+#######################################
+
+test_clip_extract() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft20_clip.mp4"
+    local probe
+
+    assert_file "$in" || return 1
+
+    # --stop-at is a DURATION relative to --start-at → expect a ~3 s clip
+    if ! run_encode -i "$in" -o "$out" \
+        -e x264 --encoder-preset veryfast --format mp4 \
+        --start-at seconds:1 --stop-at seconds:3 \
+        --audio 1 --aencoder copy --subtitle none; then
+        fail "FT-20: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out" || return 1
+
+    probe=$(ffprobe -v error -show_entries format=duration -of json "$out")
+
+    if ! echo "$probe" | jq -e '
+        (.format.duration|tonumber) >= 2.5 and
+        (.format.duration|tonumber) <= 3.5
+    ' >/dev/null; then
+        echo "Actual container duration:"
+        echo "$probe" | jq '.format.duration'
+        fail "FT-20: clip duration outside expected 3 s ± 0.5 s window"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-21: VFR → CFR conversion
+#######################################
+
+test_cfr_conversion() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft21_cfr.mp4"
+    local probe
+
+    assert_file "$in" || return 1
+
+    if ! run_encode -i "$in" -o "$out" \
+        -e x264 --encoder-preset veryfast --format mp4 \
+        --cfr --rate 30 \
+        --audio 1 --aencoder copy --subtitle none; then
+        fail "FT-21: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out" || return 1
+
+    probe=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,r_frame_rate,avg_frame_rate \
+        -of json "$out")
+
+    if ! echo "$probe" | jq -e '
+        .streams[0].avg_frame_rate=="30/1" and
+        .streams[0].r_frame_rate=="30/1"
+    ' >/dev/null; then
+        echo "Actual stream metadata:"
+        echo "$probe" | jq '.streams[0]'
+        fail "FT-21: output is not constant 30 fps"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-22: Invalid input (negative test)
+#######################################
+
+test_invalid_input() {
+    local in="$OUTPUT/ft22_garbage_input.mp4"
+    local out="$OUTPUT/ft22_garbage_out.mkv"
+
+    # 64 KiB of zero bytes – deterministic non-media data
+    if ! dd if=/dev/zero of="$in" bs=1024 count=64 2>/dev/null; then
+        fail "FT-22: could not create garbage input file"
+        return 1
+    fi
+
+    # The encoder must reject this loudly (non-zero exit) …
+    if run_encode -i "$in" -o "$out" \
+        -e x264 --audio none --subtitle none; then
+        fail "FT-22: encoder accepted invalid input (exit code 0)"
+        return 1
+    fi
+
+    # … and must not leave a non-empty output file behind
+    if [[ -s "$out" ]]; then
+        fail "FT-22: encoder produced output from invalid input"
+        return 1
+    fi
+
+    pass
+}
+
+#######################################
+# FT-23: Visual fidelity (SSIM vs source)
+#######################################
+
+test_visual_fidelity() {
+    local in="$INPUT/sdr_1080p.mp4"
+    local out="$OUTPUT/ft23_ssim.mkv"
+    local ssim
+
+    # ffmpeg ships with the same Homebrew formula as ffprobe, but is not a
+    # hard requirement of the suite – skip gracefully if absent
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        skip "ffmpeg not available for SSIM comparison"
+        return
+    fi
+
+    assert_file "$in" || return 1
+
+    # No crop/scale so the SSIM filter compares identical geometries
+    if ! run_encode -i "$in" -o "$out" \
+        -e x264 -q 18 --encoder-preset veryfast \
+        --crop 0:0:0:0 \
+        --audio none --subtitle none; then
+        fail "FT-23: encoder crashed or returned non-zero exit code"
+        return 1
+    fi
+
+    assert_file "$out" || return 1
+
+    # ssim filter logs "... All:0.987654 ..." at info level on stderr
+    ssim=$(ffmpeg -nostdin -i "$out" -i "$in" -lavfi ssim -an -f null - 2>&1 \
+        | sed -nE 's/.*All:([0-9.]+).*/\1/p' | tail -n 1)
+
+    if [[ -z "$ssim" ]]; then
+        fail "FT-23: could not compute SSIM"
+        return 1
+    fi
+
+    # Catches green/black-frame, color-shift and stride bugs that pure
+    # metadata checks cannot see (zsh arithmetic handles floats)
+    if ! (( ssim >= 0.85 )); then
+        fail "FT-23: SSIM too low ($ssim) – output visually diverges from source"
         return 1
     fi
 
@@ -864,6 +1041,12 @@ main() {
     run_test "FT-15 H.265 VT 10-bit"    test_h265_vt_10bit
     run_test "FT-16 VP9"                test_vp9_mp4
     run_test "FT-17 Theora"             test_theora
+    run_test "FT-18 Downscale HDR"      test_downscale_hdr
+    run_test "FT-19 Tonemap SDR"        test_tonemap_sdr
+    run_test "FT-20 Clip Extract"       test_clip_extract
+    run_test "FT-21 CFR Convert"        test_cfr_conversion
+    run_test "FT-22 Invalid Input"      test_invalid_input
+    run_test "FT-23 Visual SSIM"        test_visual_fidelity
 
     print "\n======================================"
 print " TEST SUMMARY"
@@ -872,7 +1055,9 @@ print "======================================"
 local failed=0
 
 for t in "${TEST_ORDER[@]}"; do
-    printf "%-25s : %s\n" "$t" "${TEST_RESULTS[$t]}"
+    # Show the recorded failure/skip reason next to the result
+    printf "%-25s : %s%s\n" "$t" "${TEST_RESULTS[$t]}" \
+        "${TEST_MESSAGES[$t]:+ – ${TEST_MESSAGES[$t]}}"
     [[ "${TEST_RESULTS[$t]}" == "FAIL" ]] && failed=1
 done
 
